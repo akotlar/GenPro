@@ -1,0 +1,184 @@
+assembly: hg19
+build_author: ec2-user
+build_date: 2018-09-08T18:46:00
+chromosomes:
+  - chr1
+  - chr2
+  - chr3
+  - chr4
+  - chr5
+  - chr6
+  - chr7
+  - chr8
+  - chr9
+  - chr10
+  - chr11
+  - chr12
+  - chr13
+  - chr14
+  - chr15
+  - chr16
+  - chr17
+  - chr18
+  - chr19
+  - chr20
+  - chr21
+  - chr22
+  - chrM
+  - chrX
+  - chrY
+database_dir: /Users/alexkotlar/hg19/index
+fileProcessors:
+  snp:
+    args: --emptyField ! --minGq .95
+    program: bystro-snp
+  vcf:
+    args: --emptyField ! --sample %sampleList% --keepId
+    program: bystro-vcf
+files_dir: /mnt/bystro-files/hg19
+statistics:
+  dbSNPnameField: dbSNP.name
+  exonicAlleleFunctionField: refSeq.exonicAlleleFunction
+  outputExtensions:
+    json: .statistics.json
+    qc: .statistics.qc.tsv
+    tab: .statistics.tsv
+  programPath: bystro-stats
+  refTrackField: ref
+  siteTypeField: refSeq.siteType
+temp_dir: /Users/alexkotlar/bystro-tmp
+tracks:
+  outputOrder:
+    - ref
+    - refSeq
+  tracks:
+    - build_author: ec2-user
+      build_date: 2018-09-08T18:46:00
+      local_files:
+        - chr*.fa.gz
+      name: ref
+      type: reference
+      utils:
+        - args:
+            remoteDir: http://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/
+            remoteFiles:
+              - chr1.fa.gz
+              - chr2.fa.gz
+              - chr3.fa.gz
+              - chr4.fa.gz
+              - chr5.fa.gz
+              - chr6.fa.gz
+              - chr7.fa.gz
+              - chr8.fa.gz
+              - chr9.fa.gz
+              - chr10.fa.gz
+              - chr11.fa.gz
+              - chr12.fa.gz
+              - chr13.fa.gz
+              - chr14.fa.gz
+              - chr15.fa.gz
+              - chr16.fa.gz
+              - chr17.fa.gz
+              - chr18.fa.gz
+              - chr19.fa.gz
+              - chr20.fa.gz
+              - chr21.fa.gz
+              - chr22.fa.gz
+              - chrM.fa.gz
+              - chrX.fa.gz
+              - chrY.fa.gz
+          completed: 2017-02-04T22:36:00
+          name: fetch
+      version: 9
+    - build_author: ec2-user
+      build_date: 2018-09-08T18:46:00
+      build_field_transformations:
+        description: split [;]
+        ensemblID: split [;]
+        kgID: split [;]
+        mRNA: split [;]
+        protAcc: split [;]
+        rfamAcc: split [;]
+        spDisplayID: split [;]
+        spID: split [;]
+        tRnaName: split [;]
+      features:
+        - name
+        - name2
+        - description
+        - kgID
+        - mRNA
+        - spID
+        - spDisplayID
+        - protAcc
+        - rfamAcc
+        - tRnaName
+        - ensemblID
+      join:
+        features:
+          - alleleID
+          - phenotypeList
+          - clinicalSignificance
+          - type
+          - origin
+          - numberSubmitters
+          - reviewStatus
+          - chromStart
+          - chromEnd
+        track: clinvar
+      local_files:
+        - hg19.kgXref.chr1.with_dbnsfp.gz
+        - hg19.kgXref.chr4.with_dbnsfp.gz
+        - hg19.kgXref.chr3.with_dbnsfp.gz
+        - hg19.kgXref.chr2.with_dbnsfp.gz
+        - hg19.kgXref.chr5.with_dbnsfp.gz
+        - hg19.kgXref.chr7.with_dbnsfp.gz
+        - hg19.kgXref.chr8.with_dbnsfp.gz
+        - hg19.kgXref.chr6.with_dbnsfp.gz
+        - hg19.kgXref.chr9.with_dbnsfp.gz
+        - hg19.kgXref.chr10.with_dbnsfp.gz
+        - hg19.kgXref.chr11.with_dbnsfp.gz
+        - hg19.kgXref.chr12.with_dbnsfp.gz
+        - hg19.kgXref.chr13.with_dbnsfp.gz
+        - hg19.kgXref.chr14.with_dbnsfp.gz
+        - hg19.kgXref.chr15.with_dbnsfp.gz
+        - hg19.kgXref.chr16.with_dbnsfp.gz
+        - hg19.kgXref.chr20.with_dbnsfp.gz
+        - hg19.kgXref.chr19.with_dbnsfp.gz
+        - hg19.kgXref.chr18.with_dbnsfp.gz
+        - hg19.kgXref.chr17.with_dbnsfp.gz
+        - hg19.kgXref.chr21.with_dbnsfp.gz
+        - hg19.kgXref.chrX.with_dbnsfp.gz
+        - hg19.kgXref.chr22.with_dbnsfp.gz
+        - hg19.kgXref.chrM.with_dbnsfp.gz
+        - hg19.kgXref.chrY.with_dbnsfp.gz
+      name: refSeq
+      type: gene
+      utils:
+        - args:
+            connection:
+              database: hg19
+            sql:
+              SELECT r.*, (SELECT GROUP_CONCAT(DISTINCT(NULLIF(x.kgID, '')) SEPARATOR
+              ';') FROM kgXref x WHERE x.refseq=r.name) AS kgID, (SELECT GROUP_CONCAT(DISTINCT(NULLIF(x.description,
+              '')) SEPARATOR ';') FROM kgXref x WHERE x.refseq=r.name) AS description,
+              (SELECT GROUP_CONCAT(DISTINCT(NULLIF(e.value, '')) SEPARATOR ';') FROM knownToEnsembl
+              e JOIN kgXref x ON x.kgID = e.name WHERE x.refseq = r.name) AS ensemblID,
+              (SELECT GROUP_CONCAT(DISTINCT(NULLIF(x.tRnaName, '')) SEPARATOR ';') FROM
+              kgXref x WHERE x.refseq=r.name) AS tRnaName, (SELECT GROUP_CONCAT(DISTINCT(NULLIF(x.spID,
+              '')) SEPARATOR ';') FROM kgXref x WHERE x.refseq=r.name) AS spID, (SELECT
+              GROUP_CONCAT(DISTINCT(NULLIF(x.spDisplayID, '')) SEPARATOR ';') FROM kgXref
+              x WHERE x.refseq=r.name) AS spDisplayID, (SELECT GROUP_CONCAT(DISTINCT(NULLIF(x.protAcc,
+              '')) SEPARATOR ';') FROM kgXref x WHERE x.refseq=r.name) AS protAcc, (SELECT
+              GROUP_CONCAT(DISTINCT(NULLIF(x.mRNA, '')) SEPARATOR ';') FROM kgXref x WHERE
+              x.refseq=r.name) AS mRNA, (SELECT GROUP_CONCAT(DISTINCT(NULLIF(x.rfamAcc,
+              '')) SEPARATOR ';') FROM kgXref x WHERE x.refseq=r.name) AS rfamAcc FROM
+              refGene r WHERE chrom=%chromosomes%;
+          completed: 2018-09-07T16:41:00
+          name: fetch
+        - args:
+            geneFile: /mnt/bystro-files/dbnsfp/dbNSFP3.5_gene.complete
+          completed: 2018-09-07T16:42:00
+          name: refGeneXdbnsfp
+      version: 9
+version: 13
