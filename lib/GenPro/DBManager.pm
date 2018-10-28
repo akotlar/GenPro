@@ -1175,35 +1175,10 @@ sub _getDbi {
     return;
   }
 
-  # LMDB::Txn->new( ${LMDB_File::Envs}{$$env}[0], $flags );
-  # p $DB;
-
-  # # $DB->Txn->BeginTxn();
-  # say "STUFFFF;";
-  # p $txn->env;
-
-  # # p $LMDB::Env::Envs{$$env};
-  # # p %{LMDB::Envs};
-  # # $$env->BeginTxn();
-
-  # $DB->Txn = LMDB::Txn->new( \$$env, $flags );
-  # say "Env: " . $DB->Txn->env;
-
-  # # $DB->Txn->commit();
-
-  # If we try to store $env here, won't work
-  # We'll get error 35 ()
-  # #define EDEADLK         35      /* Resource deadlock would occur */
-  # I think this occurs because we're holding multiple references to one
-  # environment
-  # However, it's ok to store db => $DB, since that is tied to
-  # a unique transaction, and points to a global $Env obect ( I suspect )
-  # managed by LMDB_File
-  # p $$env;
   $namedDb //= 0;
   $envs{$name}{dbs}{$namedDb} =
     { dbi => $DB->dbi, db => $DB, tflags => $flags };
-
+p $envs{$name}{dbs}{$namedDb};
   say STDERR "Made named db for $name:$namedDb";
   return $envs{$name};
 }
