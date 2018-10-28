@@ -12,6 +12,9 @@ our $VERSION = '0.001';
 #TODO: Better errors; Seem to get bad perf if copy error after each db call
 #TODO: Allow missing database only if in $dbReadOnly mode
 #TODO: Better singleton handling
+#TODO: Completely redo API to explicitly access the envName and dbName
+#separately; we now allow multiple dbs stored
+#Where the default db is say the main db, at key 0
 
 use Mouse 2;
 with 'Seq::Role::Message';
@@ -1052,38 +1055,13 @@ sub _getDbi {
   # that some chromosomes don't have any data (example: hg38 refSeq chrM)
   # my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs ) = @_;
   #       $_[0]  $_[1], $_[2],      $_[3],        $_[4],   $_[5]
-  if ( $envs{ $_[1] } && $envs{ $_[1] }{ $_[4] } ) {
-    return $envs{ $_[1] }{ $_[4] };
+  if ( $envs{ $_[1] } && $envs{ $_[1] }{dbs}{ $_[4] } ) {
+    return $envs{ $_[1] }{dbs}{ $_[4] };
   }
 
   #   $_[0]  $_[1], $_[2]
   # Don't create used by dbGetNumberOfEntries
   my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs ) = @_;
-
-  $maxDbs //= 0;
-
-  my $dbPath = $instanceConfig{databaseDir}->child($name);
-
-  # Create the database, only if that is what is intended
-  if ( !$dbPath->is_dir ) {
-
-    # If dbReadOnly flag set, this database will NEVER be created during the
-    # current execution cycle
-    if ( $instanceConfig{readOnly} ) {
-      return;
-    }
-    elsif ($dontCreate) {
-
-      # dontCreate does not imply the database will never be created,
-      # so we don't want to update $self->_envs
-      return;
-    }
-    else {
-      $dbPath->mkpath;
-    }
-  }
-
-  $dbPath = $dbPath->stringify;
 
   my $flags;
   if ( $instanceConfig{readOnly} ) {
@@ -1095,34 +1073,74 @@ sub _getDbi {
     $flags = MDB_NOSYNC;
   }
 
-  # p $dbPath;
-  my $env = LMDB::Env->new(
-    $dbPath,
-    {
-      mapsize => 128 * 1024 * 1024 * 1024,    # Plenty space, don't worry
-                                              #maxdbs => 20, # Some databases
-      mode    => 0600,
+  if ( !$envs{$name}{env} ) {
+    $maxDbs //= 0;
 
-      #can't just use ternary that outputs 0 if not read only...
-      #MDB_RDONLY can also be set per-transcation; it's just not mentioned
-      #in the docs
-      flags  => $flags,
-      maxdbs => $maxDbs
-      , # Some databases; else we get a MDB_DBS_FULL error (max db limit reached)
-      maxreaders => 128,
+    my $dbPath = $instanceConfig{databaseDir}->child($name);
+
+    # Create the database, only if that is what is intended
+    if ( !$dbPath->is_dir ) {
+
+      # If dbReadOnly flag set, this database will NEVER be created during the
+      # current execution cycle
+      if ( $instanceConfig{readOnly} ) {
+        return;
+      }
+      elsif ($dontCreate) {
+
+        # dontCreate does not imply the database will never be created,
+        # so we don't want to update $self->_envs
+        return;
+      }
+      else {
+        $dbPath->mkpath;
+      }
     }
-  );
+
+    $dbPath = $dbPath->stringify;
+
+    # p $dbPath;
+    my $env = LMDB::Env->new(
+      $dbPath,
+      {
+        mapsize => 128 * 1024 * 1024 * 1024,    # Plenty space, don't worry
+                                                #maxdbs => 20, # Some databases
+        mode    => 0600,
+
+        #can't just use ternary that outputs 0 if not read only...
+        #MDB_RDONLY can also be set per-transcation; it's just not mentioned
+        #in the docs
+        flags  => $flags,
+        maxdbs => $maxDbs,
+
+       # Some databases; else we get a MDB_DBS_FULL error (max db limit reached)
+        maxreaders => 128,
+      }
+    );
+
+    if ( !$env ) {
+      $self->_errorWithCleanup(
+"Failed to create environment $name for $instanceConfig{databaseDir} beacuse of $LMDB_File::last_err"
+      );
+      return;
+    }
+
+    $envs{$name}{env} = $env;
+  }
 
   # say STDERR "Trying to open in env $name, db $namedDb, maxdbs: $maxDbs";
+  my $env = $envs{$name}{env};
 
-  if ( !$env ) {
+  my $txn = $env->BeginTxn();
+
+  if ($LMDB_File::last_err) {
+    say STDERR "BLAH";
     $self->_errorWithCleanup(
-"Failed to create environment $name for $instanceConfig{databaseDir} beacuse of $LMDB_File::last_err"
+      "Failed to associate transaction with
+      environment $name beacuse of $LMDB_File::last_err"
     );
     return;
   }
-
-  my $txn = $env->BeginTxn();
 
   my $dbFlags;
 
@@ -1135,6 +1153,8 @@ sub _getDbi {
   my $createFlag = !$dontCreate ? MDB_CREATE : 0;
 
   my $DB = $txn->OpenDB( $namedDb, $dbFlags | $createFlag );
+
+  # p $LMDB::Env::Envs{$$env};
 
   # ReadMode 1 gives memory pointer for perf reasons, not safe
 
@@ -1155,25 +1175,42 @@ sub _getDbi {
     return;
   }
 
-  $namedDb //= 0;
+  # LMDB::Txn->new( ${LMDB_File::Envs}{$$env}[0], $flags );
+  # p $DB;
+
+  # # $DB->Txn->BeginTxn();
+  # say "STUFFFF;";
+  # p $txn->env;
+
+  # # p $LMDB::Env::Envs{$$env};
+  # # p %{LMDB::Envs};
+  # # $$env->BeginTxn();
+
+  # $DB->Txn = LMDB::Txn->new( \$$env, $flags );
+  # say "Env: " . $DB->Txn->env;
+
+  # # $DB->Txn->commit();
 
   # If we try to store $env here, won't work
   # We'll get error 35 ()
   # #define EDEADLK         35      /* Resource deadlock would occur */
-  # I think this occurs because we're holding multiple references to one 
+  # I think this occurs because we're holding multiple references to one
   # environment
-  # However, it's ok to store db => $DB, since that is tied to 
+  # However, it's ok to store db => $DB, since that is tied to
   # a unique transaction, and points to a global $Env obect ( I suspect )
   # managed by LMDB_File
-  $envs{$name}{$namedDb} =
+  # p $$env;
+  $namedDb //= 0;
+  $envs{$name}{dbs}{$namedDb} =
     { dbi => $DB->dbi, db => $DB, tflags => $flags };
 
+  say STDERR "Made named db for $name:$namedDb";
   return $envs{$name};
 }
 
 # TODO: test with Txn->env->sync instead of {env}->sync
 sub dbForceCommit {
-  my ( $self, $envName, $noSync ) = @_;
+  my ( $self, $envName, $dbName, $noSync ) = @_;
 
   if ( defined $envs{$envName} ) {
     if ( $envs{$envName}{db}->Alive ) {
@@ -1196,6 +1233,12 @@ sub dbForceCommit {
 # @param <Seq::DBManager> $self (optional)
 # @param <String> $envName (optional) : the name of a specific environment
 sub cleanUp {
+  my $msg = @_ == 2 ? $_[1] : $_[0];
+
+  $internalLog->ERR($msg);
+
+  $LMDB_File::last_err = 0;
+
   if ( !%envs && !%cursors ) {
     return 0;
   }
@@ -1229,34 +1272,39 @@ sub cleanUp {
   }
 
   foreach ( keys %envs ) {
-    foreach my $env ( values %{ $envs{$_} } ) {
+    foreach my $db ( values %{ $envs{$_}{dbs} } ) {
 
      # Check defined because database may be empty (and will be stored as undef)
-      if ( defined $env ) {
-        if ( defined $env->{db} && $env->{db}->Alive ) {
-          $env->{db}->Txn->commit();
-        }
-
-        if ( defined $env->{db}->Txn->env ) {
-
-# Sync in case MDB_NOSYNC, MDB_MAPASYNC, or MDB_NOMETASYNC were enabled
-# sync(1) flag needed to ensure that disk buffer is flushed with MDB_NOSYNC, MAPASYNC
-          $env->{db}->Txn->env->sync(1);
-          $env->{db}->Txn->env->Clean();
-        }
+      if ( defined $db->{db} && $db->{db}->Alive ) {
+        $db->{db}->Txn->commit();
 
         if ( $LMDB_File::last_err
           && $LMDB_File::last_err != MDB_NOTFOUND
           && $LMDB_File::last_err != MDB_KEYEXIST )
         {
-          _fatalError("dbCleanUp LMDB error: $LMDB_File::last_err");
+          _fatalError(
+            "dbCleanUp LMDB error during db cleanup: $LMDB_File::last_err");
 
           return 255;
         }
       }
+    }
 
-      delete $envs{$_};
+    delete $envs{$_}{dbs};
 
+    if ( defined $envs{$_}{env} ) {
+
+# Sync in case MDB_NOSYNC, MDB_MAPASYNC, or MDB_NOMETASYNC were enabled
+# sync(1) flag needed to ensure that disk buffer is flushed with MDB_NOSYNC, MAPASYNC
+      $envs{$_}{env}->sync(1);
+      $envs{$_}{env}->Clean();
+    }
+
+    if ($LMDB_File::last_err) {
+      _fatalError(
+        "dbCleanUp LMDB error during env cleanup: $LMDB_File::last_err");
+
+      return 255;
     }
 
   }
@@ -1274,8 +1322,8 @@ sub DEMOLISH {
 # status from functions
 sub _errorWithCleanup {
   my $msg = @_ == 2 ? $_[1] : $_[0];
-
-  cleanUp();
+  p $msg;
+  cleanUp($msg);
 
   _fatalError($msg);
 }
