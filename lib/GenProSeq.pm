@@ -473,7 +473,7 @@ sub annotateFile {
       my $sIdx;
       for my $sample (@$sampleListAref) {
         if ( $cnt == $max ) {
-          say STDERR "count is $cnt and max is $max: $line";
+          # say STDERR "count is $cnt and max is $max: $line";
           last;
         }
 
@@ -495,7 +495,6 @@ sub annotateFile {
         # p $val;
       }
 
-      $overallCnt += $cnt;
     }
 
     $personalDb->cleanUp();
