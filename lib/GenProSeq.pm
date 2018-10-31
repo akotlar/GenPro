@@ -44,8 +44,7 @@ has input_file => (
 has chromosomes => ( is => 'ro', required => 1, isa => 'ArrayRef' );
 
 # Maximum (signed) size of del allele
-has maxDel =>
-  ( is => 'ro', isa => 'Int', default => -32, writer => 'setMaxDel' );
+has maxDel => ( is => 'ro', isa => 'Int', default => -32, writer => 'setMaxDel' );
 
 # TODO: formalize: check that they have name and args properties
 has fileProcessors => ( is => 'ro', isa => 'HashRef', default => 'bystro-vcf' );
@@ -55,7 +54,7 @@ has fileProcessors => ( is => 'ro', isa => 'HashRef', default => 'bystro-vcf' );
 # Requires logPath to be provided (currently found in Seq::Base)
 with 'Seq::Definition', 'Seq::Role::Validator';
 
-has '+readOnly' => ( init_arg => undef, default => 0 );
+has '+readOnly' => ( init_arg => undef, default => 1 );
 
 # TODO: further reduce complexity
 sub BUILD {
@@ -68,7 +67,7 @@ sub BUILD {
   ################## Make the full output path ######################
   # The output path always respects the $self->output_file_base attribute path;
   $self->{_outPath} =
-    $self->_workingDir->child( $self->outputFilesInfo->{annotation} );
+  $self->_workingDir->child( $self->outputFilesInfo->{annotation} );
 
   # Must come before statistics, which relies on a configured Seq::Tracks
   #Expects DBManager to have been given a database_dir
@@ -84,22 +83,11 @@ sub annotate {
 
   $self->log( 'info', 'Checking input file format' );
 
-# TODO: For now we only accept tab separated files
-# We could change this, although comma separation causes may cause with our fields
-# And is slower, since we cannot split on a constant
-# We would also need to take care with properly escaping intra-field commas
-# $err = $self->setDelimiter($firstLine);
-
-  # if($err) {
-  #   $self->_errorWithCleanup($err);
-  #   return ($err, undef);
-  # }
-
-  # Calling in annotate allows us to error early
   my $err;
   ( $err, $self->{_chunkSize} ) =
-    $self->getChunkSize( $self->input_file, $self->maxThreads, 512, 16384 );
-
+  $self->getChunkSize( $self->input_file, $self->maxThreads, 512, 5000 );
+  p $self->{_chunkSize};
+  sleep(1);
   if ($err) {
     $self->_errorWithCleanup($err);
     return ( $err, undef );
@@ -137,21 +125,20 @@ sub annotate {
 
   # TODO: we don't really check for valid vcf, just assume it is
   # So this message is never reached
-  $self->_errorWithCleanup(
-    "File type isn\'t vcf or snp. Please use one of these files");
-  return ( "File type isn\'t vcf or snp. Please use one of these files",
-    undef );
+  $self->_errorWithCleanup("File type isn\'t vcf or snp. Please use one of these files");
+  return ( "File type isn\'t vcf or snp. Please use one of these files", undef );
 }
 
 sub annotateFile {
 
-#Inspired by T.S Wingo: https://github.com/wingolab-org/GenPro/blob/master/bin/vcfToSnp
+  #Inspired by T.S Wingo: https://github.com/wingolab-org/GenPro/blob/master/bin/vcfToSnp
   my $self = shift;
   my $type = shift;
 
+  # TODO: Convert genpro to Bystro track, give it its own db folder
   GenPro::DBManager::initialize(
     {
-      databaseDir => path( $self->database_dir )->child("genpro")->stringify()
+      databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
     }
   );
 
@@ -160,7 +147,7 @@ sub annotateFile {
   # This replicates sub ProcessIds {
   # which just returns an array of ids
   my ( $err, $fh, $outFh, $statsFh, $sampleListAref ) =
-    $self->_getFileHandlesAndSampleList($type);
+  $self->_getFileHandlesAndSampleList($type);
 
   if ($err) {
     $self->_errorWithCleanup($err);
@@ -169,39 +156,31 @@ sub annotateFile {
 
   if ( !@$sampleListAref ) {
     $err =
-"Need samples; did you pass \%sampleList% as an argument to the fileProcessor?";
+    "Need samples; did you pass \%sampleList% as an argument to the fileProcessor?";
 
     $self->_errorWithCleanup($err);
     return ( $err, undef );
   }
 
-  my $db  = $self->{_db};
-  my $idx = 0;
-  my %sampleIdx;
+  my $db = $self->{_db};
 
-  # How many sub-databases we need
-  my $numSamples = @$sampleListAref;
-
-  # my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs ) = @_;
-  for my $sample ( @$sampleListAref[ 0 .. 100 ] ) {
-
-    # $sampleIdx{$sample} = $idx;
-    # say STDERR "Working on sample $sample";
-
-    # $db->_getDbi("$sample");
-
+  # Create the databases, 1 database per sample,
+  # and each sample database was 25 tables, 1 per chromosome
+  my $numChr = @{ $self->chromosomes };
+  for my $sample (@$sampleListAref) {
     for my $chr ( @{ $self->chromosomes } ) {
-
-      $personalDb->_getDbi( $sample, 0, 0, $idx, $numSamples );
-      $idx++;
+      $personalDb->_getDbi( $sample, 0, 0, $chr, $numChr );
     }
-
   }
+
+  $personalDb->cleanUp();
 
   ########################## Write the header ##################################
   my $header = <$fh>;
   $self->setLineEndings($header);
 
+  # Register the output of the intermediate fileProcessor output with GenPro
+  $self->_setFinalHeader($header);
   ######################## Build the fork pool #################################
   my $abortErr;
 
@@ -209,22 +188,21 @@ sub annotateFile {
 
   # Report every 1e4 lines, to avoid thrashing receiver
   my $progressFunc =
-    $self->makeLogProgressAndPrint( \$abortErr, $outFh, $statsFh,
-    $messageFreq );
+  $self->makeLogProgressAndPrint( \$abortErr, $outFh, $statsFh, $messageFreq );
   MCE::Loop::init {
     max_workers => $self->maxThreads || 8,
     use_slurpio => 1,
 
-# bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
-# so accumulate less than we would if processing full .snp
+    # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
+    # so accumulate less than we would if processing full .snp
     chunk_size => $self->{_chunkSize} . "K",
     gather     => $progressFunc,
   };
 
-# We separate out the reference track getter so that we can check for discordant
-# bases, and pass the true reference base to other getters that may want it (like CADD)
+  # We separate out the reference track getter so that we can check for discordant
+  # bases, and pass the true reference base to other getters that may want it (like CADD)
 
- # To avoid the Moose/Mouse accessor penalty, store reference to underlying data
+  # To avoid the Moose/Mouse accessor penalty, store reference to underlying data
 
   my $refTrackGetter = $self->tracksObj->getRefTrackGetter();
 
@@ -243,6 +221,38 @@ sub annotateFile {
   # to avoid issues between GRCh37 and hg19 chrM vs MT
   # my %normalizedNames = %{$self->normalizedWantedChrs};
 
+  # TODO: Grab it from the intermediate output header ($header) and complain if not found
+  my $headerIndices = Seq::Headers::getParentIndices();
+
+  my $hetIdx = $headerIndices->{heterozygotes};
+  my $homIdx = $headerIndices->{homozygotes};
+
+  if ( !( defined $homIdx && defined $hetIdx ) ) {
+    my $err = "Require 'heterozygotes' and 'homozygotes' output for $type fileProcessor";
+    $self->_errorWithCleanup($err);
+    return ( $err, undef );
+  }
+
+  my $replacement = $geneTrackGetter->siteTypes->{replacement};
+
+  my $exonicAlleleFuncIdx = $geneTrackGetter->{_alleleFuncFidx};
+  my $codonNumIdx         = $geneTrackGetter->{_codonNumFidx};
+  my $refAaIdx            = $geneTrackGetter->{_refAaFidx};
+  my $altAaIdx            = $geneTrackGetter->{_altAaFidx};
+  my $descIdx             = $geneTrackGetter->{_featureIdxMap}{description};
+  my $nameIdx             = $geneTrackGetter->{_featureIdxMap}{name};
+  my $name2idx            = $geneTrackGetter->{_featureIdxMap}{name2};
+  my $codonPosIdx         = $geneTrackGetter->{_codonPosFidx};
+
+  # Defines feature insertion order
+  # This defines what our per-user record looks like at any given position
+  # Except we add 5 fields to beginning (chr, pos, type, ref, alt)
+  # And 1 field to end (het/hom status
+  my @wanted = (
+    $exonicAlleleFuncIdx, $codonNumIdx, $refAaIdx, $altAaIdx,
+    $descIdx, $nameIdx, $name2idx, $codonPosIdx
+  );
+
   mce_loop_f {
 
     #my ($mce, $slurp_ref, $chunk_id) = @_;
@@ -253,9 +263,9 @@ sub annotateFile {
 
     my $total = 0;
 
-    my @indelDbData;
-    my @indelRef;
-    my @lines;
+    # my @indelDbData;
+    # my @indelRef;
+    # my @lines;
     my $dataFromDbAref;
     my $zeroPos;
     my $chr;
@@ -263,70 +273,13 @@ sub annotateFile {
 
     my %cursors = ();
 
-    # Write cursors...stored as user/chr
-    my %wCursors = ();
+    ####### Read #######
+    # The ouptut of the intermediate fileProcessor is expected to be
+    # chrom \t pos \t type \t inputRef \t alt \t hets \t heterozygosity \t homs ...
 
-    my $out = [];
+    # For GenPro, we store all replacement sites for a given samples, with
+    # some informaiton about the site and the affected transcripts
 
-    # Each line is expected to be
-    # chrom \t pos \t type \t inputRef \t alt \t hets \t homozygotes \n
-    # the chrom is always in ucsc form, chr (the golang program guarantees it)
-
-    # For GenPro, we need the following record written to LMDB
-    # my $record_href = {
-    #     aa_residue => $aa_residue,
-    #     old_aa     => $codon_2_aa{$codon},
-    #     new_aa     => $codon_2_aa{$new_codon},
-    #     chr        => $chr,
-    #     chr_pos    => $pos,
-    #     codon_pos  => $codon_pos,
-    #     ref_allele => $ref_allele,
-    #     min_allele => $min_allele,
-    # };
-
-    # WriteToDb( $id, $chr, $transcript_name, $record_href );
-
-    # sub WriteToDb {
-    #     my ( $id, $chr, $key, $href ) = @_;
-    #     my $db_href = $db{$id}{$chr};
-
-    #     if ( !defined $db_href ) {
-    #         my $msg = sprintf( "Error - no db for %s %s", $id, $chr );
-    #         Log( "Fatal", $msg );
-    #     }
-    #     my $val = $db_href->{$key};
-    #     if ( !defined $val ) {
-    #         $db_href->{$key} = encode_json( [$href] );
-    #     }
-    #     else {
-    #         my $recs_aref = decode_json($val);
-    #         push @$recs_aref, $href;
-    #         $db_href->{$key} = encode_json($recs_aref);
-    #     }
-    #     }
-
-# We then want to store all replacement sites for a given id,
-# which I think is the refseq id
-# # ReadPerDb takes a path tiny object of the location to the personal databases,
-# an id, and a chromosome and returns all the replacement records for that id
-# on that chromosome
-
-# push @records, MergePerDbEntriesToRecord( $tx, $recs_aref ); in make_perprotdb2
-# this I think is because # my $file = $path->child("$id.$chr.db");...
-# each transcript id (I think this is the id), has its own database
-# and MergePerDbEntriesToRecord combines that, which I think is the personal db
-# with the reference db stuff
-
-    # No! The ids are samples
-
-    #
-    # sub ProcessIds {
-    # my ( $fieldsAref, $wantedIdHref, $altNameHref ) = @_;
-
-    # my @ids;
-
-   # # using the snpfile header line to get ids - format 'id\t\tid' and we split
-   # # using '\t' in ReadSnpFile
     while ( my $line = $MEM_FH->getline() ) {
       chomp $line;
 
@@ -336,6 +289,11 @@ sub annotateFile {
       if ( !$wantedChromosomes{ $fields[0] } ) {
         next;
       }
+
+      # if ( $chr ne $fields[0] ) {
+      #   $personalDb->dbEndCursorTxn($chr);
+      #   delete $wCursors{$chr};
+      # }
 
       $chr     = $fields[0];
       $zeroPos = $fields[1] - 1;
@@ -349,10 +307,9 @@ sub annotateFile {
       $dataFromDbAref = $db->dbReadOneCursorUnsafe( $cursors{$chr}, $zeroPos );
 
       if ( !defined $dataFromDbAref ) {
-        $self->_errorWithCleanup(
-          "Wrong assembly? $chr\: $fields[1] not found.");
+        $self->_errorWithCleanup("Wrong assembly? $chr\: $fields[1] not found.");
 
-# Store a reference to the error, allowing us to exit with a useful fail message
+        # Store a reference to the error, allowing us to exit with a useful fail message
         MCE->gather( 0, 0, "Wrong assembly? $chr\: $fields[1] not found." );
         $_[0]->abort();
         return;
@@ -364,7 +321,7 @@ sub annotateFile {
       }
 
       # for my $trackIndex (@trackIndicesExceptReference) {
-      my $out = [];
+      my @out;
 
       $geneTrackGetter->get(
         $dataFromDbAref,
@@ -372,134 +329,183 @@ sub annotateFile {
         $fields[3],    #ref
         $fields[4],    #alt
         0,
-        $out,
+        \@out,
         $zeroPos
       );
-
-      # TODO: Write hash of variant samples
-      # TODO: Write hash of variant sample
-      # Or removel imit on number of databases
-      # $fields[$refTrackOutIdx][0] = $refTrackGetter->get($dataFromDbAref);
 
       if ( $refTrackGetter->get($dataFromDbAref) ne $fields[3] ) {
         $self->log( 'info', "Discordant: $chr: $fields[1]" );
         next;
       }
 
-      # We need the following fields
-      # my $chr  = $data{Fragment}; # chr
-      # my $pos  = $data{Position}; # pos
-      # my $ref  = $data{Reference}; # ref
-      # my $type = $data{Type}; # type
-      # $ref_for_site{$chr}{$pos} = $ref;
-      # and we want to return / store
-      # if ( $prob >= 0.95 ) {
-      #   my $min_allele = $hIUPAC{$geno}{ $data{Reference} };
-      #   if ( defined $min_allele ) {
-      #     $ids{ $ids[$i] }++;
-      #     push @{ $variant_sites{$chr}{$pos}{ids} },        $ids[$i];
-      #     push @{ $variant_sites{$chr}{$pos}{min_allele} }, $min_allele;
-      #   }
-      # }
-      # @ids = map { $_ } sort { $a cmp $b } ( keys %ids );
-      # return ( \%variant_sites, \%ref_for_site, \@ids );
+      ####### Some or all of our transcripts at this location will not be replacement ####
+      # When we have a single transcript, we will have a single value for each
+      # feature, unless that feature is nested for that single transcript
+      # (ex: sometimes 2 spDisplayID entries for 1 transcript, they will be [1,2])
+      # Since exonicAlleleFunction is always 1:1 transcript, a scalar
+      # Remember all indices that are replacement, and build up a result record
+      # of just those indices
+      # All features retain order relative to the transcript,
+      # even features that have a 1 tx : M subfeatures (like spDisplayID) mapping
+      # So all we need is the indices of the exonicAlleleFunction that are replacement
+      my $func = $out[$exonicAlleleFuncIdx][0];
 
-      # my ( $variant_site_href, $ref_for_site_href, $ids_aref ) =
-      # ReadSnpFile( $snp_file, $wanted_chr, $wantedIdHref, $altIdForId_href );
-
-# path_bin is path to the parent of the .idx offset files $db_name.$chr.idx
-# ReplacementSites( $path_bin, $path_out, $variant_site_href, $ref_for_site_href, $ids_aref );
-# Then we check, for each site, whether it's a repalcement
-# If so, we store:
-# my (
-#   @codon,      @new_codon, $strand,     $gene_symbol, $codon_pos,
-#   $codon_code, $codon,     $aa_residue, $codon_number,
-# );
-#
-
-      # We drop everything that is discordant
-
-      # We write:
-
-#          if ( defined $new_base and defined $aa_residue and defined $strand ) {
-#               @new_codon = @codon;
-#               $new_codon[ $codon_pos - 1 ] = $new_base;
-#               my $new_codon = join "", @new_codon;
-#               my $new_aa    = $codon_2_aa{$new_codon};
-#               my $old_aa    = $codon_2_aa{$codon};
-
-#               # save the site for certain ids
-#               if ( defined $new_aa and defined $old_aa and $new_aa ne $old_aa ) {
-#                 # cycle through the list of IDs and minor alleles and save the transcript and
-#                 # variant info for each individual with variants in the particular transcripts
-#                 #                                                   AA_residue    original_AA         new_AA
-#                 # e.g., push @{ r_sites{$id}{$transcript_name} }, "$aa_residue:$codon2_aa{$codon}:$codon_2_aa{$new_codon}";
-#                 for ( my $i = 0; $i < @$min_alleles_aref; $i++ ) {
-#                   my $id        = $these_ids_aref->[$i];
-#                   my $id_allele = $min_alleles_aref->[$i];
-#                   if ( $id_allele eq $min_allele ) {
-# my $record_href = {
-#   aa_residue => $aa_residue,
-#   old_aa     => $codon_2_aa{$codon},
-#   new_aa     => $codon_2_aa{$new_codon},
-#   chr        => $chr,
-#   chr_pos    => $pos,
-#   codon_pos  => $codon_pos,
-#   ref_allele => $ref_allele,
-#   min_allele => $min_allele,
-# };
-
-      # Essentially, we write everything that is a repalcement
-
-# This is what we get out of the gene track:
-#  $outAccum->[$idxMap->{$feature}][$posIdx] = [map { $geneDb->[$_]{$cachedDbNames->{$feature}} } @$txNumbers];
-# $outAccum->[$self->{_codonPosFidx}][$posIdx] = \@codonPos;
-# $outAccum->[$self->{_codonNumFidx}][$posIdx] = \@codonNum;
-# $outAccum->[$self->{_alleleFuncFidx}][$posIdx] = \@funcAccum;
-# $outAccum->[$self->{_refAaFidx}][$posIdx] = \@refAA;
-# $outAccum->[$self->{_altAaFidx}][$posIdx] = \@newAA;
-# $outAccum->[$self->{_codonSidx}][$posIdx] = \@codonSeq;
-# $outAccum->[$self->{_altCodonSidx}][$posIdx] = \@newCodon;
-
-      # ...
-
-# push @{ $outAccum->[$self->{_strandFidx}][$posIdx] }, $site->[$strandIdx];
-#     push @{ $outAccum->[$self->{_siteFidx}][$posIdx] }, $site->[$siteTypeIdx];
-# we want all of this stuff... per sample
-
-      # and we also want chr, position, and the transcript name
-      # push @lines, \@fields;
-
-      my $dbPath;
-      for my $sample (@$sampleListAref) {
-
-        # $dbPath = "$sample/$chr";
-        # p $dbPath;
-        $wCursors{$dbPath} //= $db->dbStartCursorTxn($sample);
-
-        $db->dbPutCursorUnsafe( $wCursors{$dbPath},
-          $dbPath, 0, $zeroPos, $out );
+      # Check that we don't want stopGain, stopLoss, startGain, or spliceD/A
+      if ( !defined $func || ( !ref $func && $func ne $replacement ) ) {
+        next;
       }
 
+      my $found = 0;
+      my @ok;
+      for ( my $idx = 0 ; $idx < @$func ; $idx++ ) {
+        if ( !defined $func->[$idx] || $func->[$idx] ne $replacement ) {
+          push @ok, $idx;
+          next;
+        }
+
+        $found ||= 1;
+
+        # $idx++;
+      }
+
+      if ( !$found ) {
+        next;
+      }
+
+      ################### What we aim to write ########################
+      # TODO: Can optimize away insertion of exonicAlleleFunction is only
+      # interested in replacement sites
+      # We're going to do this as an array, following @wanted, defined above
+      # my $record_href = {
+      #   aa_residue => $aa_residue,
+      #   old_aa     => $codon_2_aa{$codon},
+      #   new_aa     => $codon_2_aa{$new_codon},
+      #   chr        => $chr,
+      #   chr_pos    => $pos,
+      #   codon_pos  => $codon_pos,
+      #   ref_allele => $ref_allele,
+      #   min_allele => $min_allele,
+      # };
+
+      # WriteToDb( $id, $chr, $transcript_name, $record_href );
+      #                   }
+      #                 }
+      #               }
+      #             }
+      #             $dat_record_len -= $dat_typedef_size;
+      #           }
+      #         }
+      #       }
+      #     }
+      #   }
+
+      # TODO: Optimize allocations
+      # flexible features (such as description, not necessary for the Gene class)
+      my @record;
+
+      # First 4 record; last record is whether it's a het or a hom
+      $#record = $#wanted + 5;
+
+      $record[0] = $fields[0];    #chr
+      $record[1] = $fields[1];    #pos
+      $record[2] = $fields[2];    #type (SNP, INS, DEL, etc), could remove
+      $record[3] = $fields[3];    #ref
+      $record[4] = $fields[4];    #alt
+
+      # could be more elegant
+      # build up the array of results
+      if ( @ok == 0 ) {
+        my $outIdx = 5;
+        for my $fIdx (@wanted) {
+          # 0 because non-indels have only 1 position index
+          $record[$outIdx] = $out[$fIdx][0];
+          $outIdx++;
+        }
+      } elsif ( @ok == 1 ) {
+        my $txIdx = @ok;
+
+        my $outIdx = 5;
+        for my $fIdx (@wanted) {
+          # 0 because non-indels have only 1 position index
+          $record[$outIdx] = $out[$fIdx][0][$txIdx];
+          $outIdx++;
+        }
+      } else {
+        my $seenFirst;
+        for my $txIdx (@ok) {
+
+          if ( !$seenFirst ) {
+            my $outIdx = 5;
+            for my $fIdx (@wanted) {
+              # 0 because non-indels have only 1 position index
+              $record[$outIdx] = [ $out[$fIdx][0][$txIdx] ];
+              $outIdx++;
+            }
+
+            $seenFirst = 1;
+            next;
+          }
+
+          my $outIdx = 5;
+          for my $fIdx (@wanted) {
+            # 0 because non-indels have only 1 position index
+            push @{ $record[$outIdx] }, $out[$fIdx][0][$txIdx];
+            $outIdx++;
+          }
+        }
+      }
+
+      my %hets;
+      if ( $fields[$hetIdx] ne '!' ) {
+        %hets = map { $_ => 1 } split( ';', $fields[$hetIdx] );
+      }
+
+      my %homs;
+      if ( $fields[$homIdx] ne '!' ) {
+        %homs = map { $_ => 1 } split( ';', $fields[$homIdx] );
+      }
+
+      my $cnt = 0;
+      # Can no longer use keys % in scalar context
+      # This seems to work
+      my $max = %hets + %homs;
+
+      my $sIdx;
+      for my $sample (@$sampleListAref) {
+        if ( $cnt == $max ) {
+          say STDERR "count is $cnt and max is $max: $line";
+          last;
+        }
+
+        # Store whether het or not
+        if ( $hets{$sample} ) {
+          $record[-1] = 0;
+        } elsif ( $homs{$sample} ) {
+          $record[-1] = 1;
+        } else {
+          next;
+        }
+
+        $cnt++;
+
+        $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
+
+        # Uncomment to test
+        # my $val = $personalDb->dbReadOne( $sample, $chr, $zeroPos );
+        # p $val;
+      }
+
+      $overallCnt += $cnt;
     }
 
+    $personalDb->cleanUp();
     close $MEM_FH;
 
-    # if (@lines) {
-    #     MCE->gather(
-    #       scalar @lines,
-    #       $total - @lines,
-    #       undef, $outputter->makeOutputString( \@lines )
-    #     );
-    # }
-    # else {
-    #     MCE->gather( 0, $total );
-    # }
 
   }
   $fh;
 
-  # Force flush
+  # Force flush of output
   $progressFunc->( 0, 0, undef, undef, 1 );
 
   MCE::Loop::finish();
@@ -522,10 +528,10 @@ sub annotateFile {
   # This simply tries each close/sync/move operation in order
   # And returns an error early, or proceeds to next operation
   $err =
-       $self->safeClose($outFh)
-    || ( $statsFh && $self->safeClose($statsFh) )
-    || $self->safeSystem('sync')
-    || $self->_moveFilesToOutputDir();
+     $self->safeClose($outFh)
+  || ( $statsFh && $self->safeClose($statsFh) )
+  || $self->safeSystem('sync')
+  || $self->_moveFilesToOutputDir();
 
   if ($err) {
     $self->_errorWithCleanup($err);
@@ -553,7 +559,7 @@ sub makeLogProgressAndPrint {
   }
   return sub {
 
-#<Int>$annotatedCount, <Int>$skipCount, <Str>$err, <Str>$outputLines, <Bool> $forcePublish = @_;
+    #<Int>$annotatedCount, <Int>$skipCount, <Str>$err, <Str>$outputLines, <Bool> $forcePublish = @_;
     ##    $_[0],          $_[1]           , $_[2],     $_[3].           , $_[4]
     if ( $_[2] ) {
       $$abortErrRef = $_[2];
@@ -584,7 +590,7 @@ sub makeLogProgressAndPrint {
 
       print $outFh $_[3];
     }
-    }
+  }
 }
 
 sub _getFileHandles {
@@ -636,8 +642,7 @@ sub _getFileHandlesAndSampleList {
   }
 
   my $sampleListPath =
-    $self->_workingDir->child( $self->outputFilesInfo->{sampleList} )
-    ->stringify();
+  $self->_workingDir->child( $self->outputFilesInfo->{sampleList} )->stringify();
 
   my $sampleListFh;
   $err = $self->safeOpen( $sampleListFh, '<', $sampleListPath );
@@ -663,11 +668,9 @@ sub _openAnnotationPipe {
   my $fh;
 
   my $args = $self->_getFileProcessor($type);
-  p $args;
 
   # TODO:  add support for GQ filtering in vcf
-  my $err =
-    $self->safeOpen( $fh, '-|', "$echoProg $inPath | $args 2> $errPath" );
+  my $err = $self->safeOpen( $fh, '-|', "$echoProg $inPath | $args 2> $errPath" );
 
   return ( $err, $fh );
 }
@@ -676,13 +679,13 @@ sub _getFileInfo {
   my $self = shift;
 
   my $errPath =
-    $self->_workingDir->child( $self->input_file->basename . '.file-log.log' );
+  $self->_workingDir->child( $self->input_file->basename . '.file-log.log' );
 
   my $inPath = $self->inputFilePath;
   my $echoProg =
-      $self->isCompressedSingle($inPath)
-    ? $self->gzip . ' ' . $self->decompressArgs
-    : 'cat';
+    $self->isCompressedSingle($inPath)
+  ? $self->gzip . ' ' . $self->decompressArgs
+  : 'cat';
 
   return ( $errPath, $inPath, $echoProg );
 }
@@ -700,14 +703,14 @@ sub _getFileProcessor {
   for my $type ( keys %{ $self->outputFilesInfo } ) {
     if ( index( $args, "\%$type\%" ) > -1 ) {
       substr( $args, index( $args, "\%$type\%" ), length("\%$type\%") ) =
-        $self->_workingDir->child( $self->outputFilesInfo->{$type} );
+      $self->_workingDir->child( $self->outputFilesInfo->{$type} );
     }
   }
 
   return $args;
 }
 
-sub _getFinalHeader {
+sub _setFinalHeader {
   my ( $self, $header ) = @_;
   ######### Build the header, and write it as the first line #############
   my $finalHeader = Seq::Headers->new();
@@ -716,23 +719,23 @@ sub _getFinalHeader {
 
   my @headerFields = split '\t', $header;
 
-# Our header class checks the name of each feature
-# It may be, more than likely, that the pre-processor names the 4th column 'ref'
-# We replace this column with trTv
-# This not only now reflects its actual function
-# but prevents name collision issues resulting in the wrong header idx
-# being generated for the ref track
+  # Our header class checks the name of each feature
+  # It may be, more than likely, that the pre-processor names the 4th column 'ref'
+  # We replace this column with trTv
+  # This not only now reflects its actual function
+  # but prevents name collision issues resulting in the wrong header idx
+  # being generated for the ref track
   $headerFields[3] = $self->discordantField;
 
-# Bystro takes data from a file pre-processor, which spits out a common
-# intermediate format
-# This format is very flexible, in fact Bystro doesn't care about the output
-# of the pre-processor, provided that the following is found in the corresponding
-# indices:
-# idx 0: chromosome,
-# idx 1: position
-# idx 3: the reference (we rename this to discordant)
-# idx 4: the alternate allele
+  # Bystro takes data from a file pre-processor, which spits out a common
+  # intermediate format
+  # This format is very flexible, in fact Bystro doesn't care about the output
+  # of the pre-processor, provided that the following is found in the corresponding
+  # indices:
+  # idx 0: chromosome,
+  # idx 1: position
+  # idx 3: the reference (we rename this to discordant)
+  # idx 4: the alternate allele
 
   # Prepend all of the headers created by the pre-processor
   $finalHeader->addFeaturesToHeader( \@headerFields, undef, 1 );
