@@ -86,8 +86,8 @@ sub annotate {
   my $err;
   ( $err, $self->{_chunkSize} ) =
   $self->getChunkSize( $self->input_file, $self->maxThreads, 512, 5000 );
-  p $self->{_chunkSize};
-  sleep(1);
+  # p $self->{_chunkSize};
+  # sleep(1);
   if ($err) {
     $self->_errorWithCleanup($err);
     return ( $err, undef );
@@ -135,14 +135,6 @@ sub annotateFile {
   my $self = shift;
   my $type = shift;
 
-  # TODO: Convert genpro to Bystro track, give it its own db folder
-  GenPro::DBManager::initialize(
-    {
-      databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
-    }
-  );
-
-  my $personalDb = GenPro::DBManager->new();
 
   # This replicates sub ProcessIds {
   # which just returns an array of ids
@@ -164,17 +156,27 @@ sub annotateFile {
 
   my $db = $self->{_db};
 
-  # Create the databases, 1 database per sample,
-  # and each sample database was 25 tables, 1 per chromosome
-  my $numChr = @{ $self->chromosomes };
-  for my $sample (@$sampleListAref) {
-    for my $chr ( @{ $self->chromosomes } ) {
-      $personalDb->_getDbi( $sample, 0, 0, $chr, $numChr );
-    }
-  }
+  # # TODO: Convert genpro to Bystro track, give it its own db folder
+  # GenPro::DBManager::initialize(
+  #   {
+  #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
+  #   }
+  # );
 
-  $personalDb->cleanUp();
+  # my $personalDb = GenPro::DBManager->new();
 
+  # # Create the databases, 1 database per sample,
+  # # and each sample database was 25 tables, 1 per chromosome
+  # my $numChr   = @{ $self->chromosomes };
+  # my $nSamples = @$sampleListAref;
+  # for my $chr ( @{ $self->chromosomes } ) {
+  #   for my $sample (@$sampleListAref) {
+  #     $personalDb->_getDbi( $chr, 0, 0, $sample, $nSamples );
+  #   }
+  # }
+
+  # $personalDb->cleanUp();
+  # undef $personalDb;
   ########################## Write the header ##################################
   my $header = <$fh>;
   $self->setLineEndings($header);
@@ -188,7 +190,8 @@ sub annotateFile {
 
   # Report every 1e4 lines, to avoid thrashing receiver
   my $progressFunc =
-  $self->makeLogProgressAndPrint( \$abortErr, $outFh, $statsFh, $messageFreq );
+  $self->makeDbWriter( \$abortErr, $outFh, $statsFh, $messageFreq, $sampleListAref );
+
   MCE::Loop::init {
     max_workers => $self->maxThreads || 8,
     use_slurpio => 1,
@@ -255,9 +258,10 @@ sub annotateFile {
 
   mce_loop_f {
 
-    #my ($mce, $slurp_ref, $chunk_id) = @_;
+    my ( $mce, $slurp_ref, $chunk_id ) = @_;
     #    $_[0], $_[1],     $_[2]
-    #open my $MEM_FH, '<', $slurp_ref; binmode $MEM_FH, ':raw';
+    # open my $MEM_FH, '<', $slurp_ref;
+    # binmode $MEM_FH, ':raw';
     open my $MEM_FH, '<', $_[1];
     binmode $MEM_FH, ':raw';
 
@@ -271,7 +275,17 @@ sub annotateFile {
     my $chr;
     my @fields;
 
+    my @results;
+
     my %cursors = ();
+
+    # GenPro::DBManager::initialize(
+    #   {
+    #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
+    #   }
+    # );
+
+    # my $personalDb = GenPro::DBManager->new();
 
     ####### Read #######
     # The ouptut of the intermediate fileProcessor is expected to be
@@ -289,11 +303,6 @@ sub annotateFile {
       if ( !$wantedChromosomes{ $fields[0] } ) {
         next;
       }
-
-      # if ( $chr ne $fields[0] ) {
-      #   $personalDb->dbEndCursorTxn($chr);
-      #   delete $wCursors{$chr};
-      # }
 
       $chr     = $fields[0];
       $zeroPos = $fields[1] - 1;
@@ -471,6 +480,9 @@ sub annotateFile {
       my $max = %hets + %homs;
 
       my $sIdx;
+      my @samples;
+      my $het = 1;
+
       for my $sample (@$sampleListAref) {
         if ( $cnt == $max ) {
           # say STDERR "count is $cnt and max is $max: $line";
@@ -479,35 +491,51 @@ sub annotateFile {
 
         # Store whether het or not
         if ( $hets{$sample} ) {
-          $record[-1] = 0;
+          # $het = 1;
         } elsif ( $homs{$sample} ) {
-          $record[-1] = 1;
+          $het = 0;
         } else {
           next;
         }
 
         $cnt++;
+        push @samples, [ $het, $sample ];
 
-        $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
+        # $personalDb->dbReadOne( $sample, $chr, $zeroPos );
+
+        # Seems to work find
+        # $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
 
         # Uncomment to test
         # my $val = $personalDb->dbReadOne( $sample, $chr, $zeroPos );
         # p $val;
       }
 
+      # If it becomes unsafe to use NOTLS and write from multiple processes
+      push @results, [ \@samples, $chr, $zeroPos, \@record ];
+
+      if ( @results > 1024 ) {
+        $progressFunc->( \@results );
+        @results = ();
+      }
+    }
+    say STDERR "Done";
+
+    if (@results) {
+      $progressFunc->( \@results );
     }
 
-    $personalDb->cleanUp();
+    # $personalDb->cleanAndWipeSingleton();
+    # undef $personalDb;
     close $MEM_FH;
-
-
   }
   $fh;
 
   # Force flush of output
-  $progressFunc->( 0, 0, undef, undef, 1 );
+  $progressFunc->(undef);
 
   MCE::Loop::finish();
+
 
   # Unfortunately, MCE::Shared::stop() removes the value of $abortErr
   # according to documentation, and I did not see mention of a way
@@ -542,8 +570,27 @@ sub annotateFile {
   return ( $err, $self->outputFilesInfo );
 }
 
-sub makeLogProgressAndPrint {
-  my ( $self, $abortErrRef, $outFh, $statsFh, $throttleThreshold ) = @_;
+sub makeDbWriter {
+  my ( $self, $abortErrRef, $outFh, $statsFh, $throttleThreshold, $sampleListAref ) = @_;
+
+  # TODO: Convert genpro to Bystro track, give it its own db folder
+  GenPro::DBManager::initialize(
+    {
+      databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
+    }
+  );
+
+  my $personalDb = GenPro::DBManager->new();
+
+  # Create the databases, 1 database per sample,
+  # and each sample database was 25 tables, 1 per chromosome
+  my $nChr = @{ $self->chromosomes };
+  # my $nSamples = @$sampleListAref;
+  for my $sample (@$sampleListAref) {
+    for my $chr ( @{ $self->chromosomes } ) {
+      $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
+    }
+  }
 
   my $totalAnnotated = 0;
   my $totalSkipped   = 0;
@@ -556,38 +603,28 @@ sub makeLogProgressAndPrint {
   if ( !$throttleThreshold ) {
     $throttleThreshold = 1e4;
   }
-  return sub {
 
-    #<Int>$annotatedCount, <Int>$skipCount, <Str>$err, <Str>$outputLines, <Bool> $forcePublish = @_;
-    ##    $_[0],          $_[1]           , $_[2],     $_[3].           , $_[4]
-    if ( $_[2] ) {
-      $$abortErrRef = $_[2];
+  my ( $sampleAref, $chr, $zeroPos, $recordAref );
+  return sub {
+    my ($resultsAref) = @_;
+    #my ( $sampleAref, $chr, $zeroPos, $recordAref ) = @_;
+
+    if ( !$resultsAref ) {
+      # Could clean up here
+
+      $personalDb->cleanAndWipeSingleton();
       return;
     }
 
-    if ($publish) {
-      $thresholdAnn     += $_[0];
-      $thresholdSkipped += $_[1];
+    for my $result (@$resultsAref) {
+      ( $sampleAref, $chr, $zeroPos, $recordAref ) = @$result;
 
-      if ( $_[4]
-        || $thresholdAnn + $thresholdSkipped >= $throttleThreshold )
-      {
-        $totalAnnotated += $thresholdAnn;
-        $totalSkipped   += $thresholdSkipped;
+      for my $sample (@$sampleAref) {
+        $recordAref->[-1] = $sample->[0];
 
-        $self->publishProgress( $totalAnnotated, $totalSkipped );
-
-        $thresholdAnn     = 0;
-        $thresholdSkipped = 0;
+        # Works to read
+        $personalDb->dbPatch( $sample->[1], $chr, 0, $zeroPos, $recordAref );
       }
-    }
-
-    if ( $_[3] ) {
-      if ($statsFh) {
-        print $statsFh $_[3];
-      }
-
-      print $outFh $_[3];
     }
   }
 }

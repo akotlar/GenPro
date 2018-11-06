@@ -85,12 +85,7 @@ sub initialize {
     $internalLog->WARN("dbManager already initialized; clearing state");
   }
 
-  cleanUp();
-
-  undef $instance;
-  undef %instanceConfig;
-  undef %envs;
-  undef %cursors;
+  cleanAndWipeSingleton();
 
   if ( !$data->{databaseDir} ) {
     $internalLog->ERR("dbManager requires a databaseDir");
@@ -142,7 +137,7 @@ my $mp = Data::MessagePack->new()->prefer_integer()->prefer_float32();
 # Read transactions are committed by default
 sub dbReadOne {
 
-  #my ($self, $envName, $dbName,$posAref, $skipCommit, $stringKeys,) = @_;
+  #my ($self, $envName, $dbName,$zeroPos, $skipCommit, $stringKeys,) = @_;
   #== $_[0], $_[1],     $_[2]  ,$_[3]   , $_[4]      , $_[5] (don't assign to avoid copy)
 
   #It is possible not to find a database in $dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
@@ -151,7 +146,7 @@ sub dbReadOne {
   my $db = $_[0]->_getDbi( $_[1], 1, $_[5], $_[2] ) or return;
 
   if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
+    $db->{db}->Txn = $db->{env}->BeginTxn();
 
     # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
     $db->{db}->Txn->AutoCommit(1);
@@ -366,14 +361,14 @@ sub dbPatch {
   #my $db = $self->_getDbi($chr, 0, $stringKeys);
   my $db = $_[0]->_getDbi( $_[1], 0, $_[8], $_[2] ) or return 255;
 
-  if ( !$db ) {
+  if ( !$db || !$db->{db} || !$db->{env} ) {
     $_[0]->_errorWithCleanup( "Couldn't open $_[1] database. readOnly is "
       . ( $instanceConfig{readOnly} ? "set" : "not set" ) );
     return 255;
   }
 
   if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
+    $db->{db}->Txn = $db->{env}->BeginTxn();
 
     # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
     $db->{db}->Txn->AutoCommit(1);
@@ -399,16 +394,16 @@ sub dbPatch {
 
   my $aref = defined $json ? $mp->unpack($json) : [];
 
+  my $write = 1;
   #Undefined track values are allowed as universal-type "missing data" signal
-  #$aref->[$trackIndex]
+  #            $aref->[$trackIndex]
   if ( defined $aref->[ $_[3] ] ) {
 
     #if($mergeFunc) {
     if ( $_[6] ) {
 
-      #$aref->[$trackIndex]) = $mergeFunc->($chr, $pos, $aref->[$trackIndex], $trackValue);
-      ( my $err, $aref->[ $_[3] ] ) =
-      $_[6]->( $_[1], $_[4], $aref->[ $_[3] ], $_[5] );
+      #$aref->[$trackIndex]) = $mergeFunc  ->($envName,$pos, $aref->[$trackIndex], $trackValue);
+      ( my $err, $aref->[ $_[3] ] ) = $_[6]->( $_[1], $_[4], $aref->[ $_[3] ], $_[5] );
 
       if ($err) {
 
@@ -417,18 +412,26 @@ sub dbPatch {
         return 255;
       }
 
+      # TODO: is this right? Should we set the val to undef?
       # Nothing to update
-      if ( !defined $aref->[ $_[3] ] ) {
-        return 0;
-      }
+      # if ( !defined $aref->[ $_[3] ] ) {
+      #   # return 0;
+      # }
+      $write = 0;
     } else {
-
-      # No overriding
-      return 0;
+      # If we return here, the environemnt just dissapears, not sure why
+      # Even though we don't commit, seems it should be ok?
+      # Maybe a NO_TLS issue?
+      # else {
+      #   return 0;
+      # }
+      $write = 0;
     }
+
+    # Else no override
   } else {
 
-    #[$trackIndex] = $trackValue
+    #$aref->[$trackIndex] = $trackValue
     $aref->[ $_[3] ] = $_[5];
   }
 
@@ -437,14 +440,14 @@ sub dbPatch {
 
     #$self->
     $_[0]->log( 'info', "DBManager dry run: would have dbPatch $_[1]\:$_[4]" );
-  } else {
-
+  } elsif ($write) {
     #$txn->put($db->{dbi}, $pos, $mp->pack($aref));
     $txn->put( $db->{dbi}, $_[4], $mp->pack($aref) );
+    $txn->commit() unless $_[7];
+  } else {
+    # say STDERR "ABORTING";
+    $txn->abort() unless $_[7];
   }
-
-  #if(!$skipCommit) {
-  $txn->commit() unless $_[7];
 
   if ($LMDB_File::last_err) {
     if ( $LMDB_File::last_err != MDB_KEYEXIST ) {
@@ -1053,7 +1056,8 @@ sub _getDbi {
     return $envs{ $_[1] }{dbs}{ $_[4] };
   }
 
-  my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs ) = @_;
+  # say STDERR "Couldn't find $_[1]:$_[4]";
+  my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs, $mapSize ) = @_;
 
   # MDB_NOTLS must be used, because over some # of databases,
   #
@@ -1072,7 +1076,12 @@ sub _getDbi {
   }
 
   if ( !$envs{$name}{env} ) {
-    $maxDbs //= 0;
+    $maxDbs //= 25;
+
+    # Maximum db size
+    # This * # of environments must be < 2^48 or maybe 2^47
+    # else out of memory (64bit CPU != 64 bit addressable)
+    $mapSize //= 16 * 1024 * 1024 * 1024;
 
     my $dbPath = $instanceConfig{databaseDir}->child($name);
 
@@ -1099,11 +1108,11 @@ sub _getDbi {
     my $env = LMDB::Env->new(
       $dbPath,
       {
-        mapsize    => 16 * 1024 * 1024 * 1024,    # Plenty space, don't worry
+        mapsize    => $mapSize,
         mode       => 0600,
         flags      => $flags,
         maxdbs     => $maxDbs + 1,
-        maxreaders => 128,
+        maxreaders => 32,
       }
     );
 
@@ -1124,7 +1133,7 @@ sub _getDbi {
 
   if ($LMDB_File::last_err) {
     $self->_errorWithCleanup(
-      "Failed to associate transaction with environment $name
+      "Failed to associate transaction with environment $name:$namedDb
       beacuse of $LMDB_File::last_err"
     );
     return;
@@ -1168,8 +1177,10 @@ sub _getDbi {
     dbi    => $DB->dbi,
     db     => $DB,
     tflags => $flags,
-    env    => \$envs{$name}{env},
+    env    => $envs{$name}{env},
   };
+
+  # say STDERR "Opened $name:$namedDb";
 
   return $envs{$name}{dbs}{$namedDb};
 }
@@ -1203,7 +1214,9 @@ sub dbForceCommit {
 sub cleanUp {
   my $msg = @_ == 2 ? $_[1] : $_[0];
 
-  $internalLog->ERR($msg);
+  if ($msg) {
+    $internalLog->ERR($msg);
+  }
 
   $LMDB_File::last_err = 0;
 
@@ -1242,6 +1255,10 @@ sub cleanUp {
     }
   }
 
+  # May not be necessary, but easier to read, protect against references
+  # not being properly deleted
+  undef %cursors;
+
   foreach ( keys %envs ) {
     foreach my $db ( values %{ $envs{$_}{dbs} } ) {
 
@@ -1279,7 +1296,18 @@ sub cleanUp {
     }
   }
 
+  # May not be necessary, but easier to read, protect against references
+  # not being properly deleted
+  undef %envs;
+
   return 0;
+}
+
+sub cleanAndWipeSingleton {
+  cleanUp();
+
+  undef $instance;
+  undef %instanceConfig;
 }
 
 # Like DESTROY, but Moosier
