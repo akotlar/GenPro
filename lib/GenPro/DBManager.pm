@@ -142,7 +142,7 @@ sub dbReadOne {
 
   #It is possible not to find a database in $dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
   #http://ideone.com/uzpdZ8
-  #                      #$name, $dontCreate, $stringKeys
+  #                      #$name, $dontCreate, $stringKeys, $dbName
   my $db = $_[0]->_getDbi( $_[1], 1, $_[5], $_[2] ) or return;
 
   if ( !$db->{db}->Alive ) {
@@ -488,7 +488,7 @@ sub dbPut {
   }
 
   if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
+    $db->{db}->Txn = $db->{env}->BeginTxn();
 
     # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
     $db->{db}->Txn->AutoCommit(1);
@@ -997,23 +997,24 @@ sub dbReadMeta {
 sub dbPatchMeta {
   my ( $self, $databaseName, $metaKey, $data ) = @_;
 
-  my $dbName = $databaseName . $metaDbNamePart;
+  # my $dbName = $databaseName . $metaDbNamePart;
 
   # If the user treats this metaKey as a scalar value, overwrite whatever was there
   if ( !ref $data ) {
     # undef : commit every transcation
     # 1 : use string keys
-    $self->dbPut( $dbName, $metaKey, $data, undef, 1 );
+    $self->dbPut( $databaseName, $metaDbNamePart, $metaKey, $data, undef, 1 );
   } else {
 
     # Pass 1 to merge $data with whatever was kept at this metaKey
     # Pass 1 to use string keys for meta databases
-    $self->dbPatchHash( $dbName, $metaKey, $data, undef, undef, 1, 1 );
+    $self->dbPatchHash( $databaseName, $metaDbNamePart, $metaKey, $data, undef, undef, 1,
+      1 );
   }
 
   # Make sure that we update/sync the meta data asap, since this is critical
   # to db integrity
-  $self->dbForceCommit( $dbName, 0 );
+  $self->dbForceCommit( $databaseName, 0 );
   return;
 }
 
@@ -1052,8 +1053,8 @@ sub _getDbi {
   # that some chromosomes don't have any data (example: hg38 refSeq chrM)
   # my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs ) = @_;
   #       $_[0]  $_[1], $_[2],      $_[3],        $_[4],   $_[5]
-  if ( $envs{ $_[1] } && $envs{ $_[1] }{dbs}{ $_[4] } ) {
-    return $envs{ $_[1] }{dbs}{ $_[4] };
+  if ( $envs{ $_[1] } && $envs{ $_[1] }{dbs}{ $_[4] || 0 } ) {
+    return $envs{ $_[1] }{dbs}{ $_[4] || 0 };
   }
 
   # say STDERR "Couldn't find $_[1]:$_[4]";
@@ -1139,7 +1140,7 @@ sub _getDbi {
     return;
   }
 
-  my $dbFlags;
+  my $dbFlags = 0;
 
   # Much faster random, somewhat faster sequential performance
   # Much smaller database size (4 byte keys, vs 6-10 byte keys)

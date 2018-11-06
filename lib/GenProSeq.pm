@@ -19,6 +19,7 @@ use MCE::Loop;
 use Seq::InputFile;
 use Seq::Output;
 use Seq::Output::Delimiters;
+use Seq::Tracks::Build::CompletionMeta;
 use Seq::Headers;
 
 use lib './lib';
@@ -86,8 +87,7 @@ sub annotate {
   my $err;
   ( $err, $self->{_chunkSize} ) =
   $self->getChunkSize( $self->input_file, $self->maxThreads, 512, 5000 );
-  # p $self->{_chunkSize};
-  # sleep(1);
+
   if ($err) {
     $self->_errorWithCleanup($err);
     return ( $err, undef );
@@ -111,12 +111,12 @@ sub annotate {
 
   if ( $fileType eq 'snp' ) {
     $self->log( 'info', 'Beginning annotation' );
-    return $self->annotateFile('snp');
+    return $self->makePersonalProtDb('snp');
   }
 
   if ( $fileType eq 'vcf' ) {
     $self->log( 'info', 'Beginning annotation' );
-    return $self->annotateFile('vcf');
+    return $self->makePersonalProtDb('vcf');
   }
 
   # TODO: Inspect vcf header
@@ -129,7 +129,7 @@ sub annotate {
   return ( "File type isn\'t vcf or snp. Please use one of these files", undef );
 }
 
-sub annotateFile {
+sub makePersonalProtDb {
 
   #Inspired by T.S Wingo: https://github.com/wingolab-org/GenPro/blob/master/bin/vcfToSnp
   my $self = shift;
@@ -157,23 +157,46 @@ sub annotateFile {
   my $db = $self->{_db};
 
   # # TODO: Convert genpro to Bystro track, give it its own db folder
-  # GenPro::DBManager::initialize(
-  #   {
-  #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
-  #   }
-  # );
+  # TODO: Convert genpro to Bystro track, give it its own db folder
+  GenPro::DBManager::initialize(
+    {
+      databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
+    }
+  );
 
-  # my $personalDb = GenPro::DBManager->new();
+  my $personalDb = GenPro::DBManager->new();
+  my $metaEnv    = 'stats';
+  my $metaDb     = 'completed';
+  my $metaKey    = 'sampleWritten';
 
-  # # Create the databases, 1 database per sample,
-  # # and each sample database was 25 tables, 1 per chromosome
-  # my $numChr   = @{ $self->chromosomes };
+  $personalDb->_getDbi( $metaEnv, 0, 1, $metaDb, 10 );
+
+  my %okToBuild;
+  my %seen;
+  # Create the databases, 1 database per sample,
+  # and each sample database was 25 tables, 1 per chromosome
+  my $nChr = @{ $self->chromosomes };
+
+  my $toBuild = 0;
+  my %completionMeta;
   # my $nSamples = @$sampleListAref;
-  # for my $chr ( @{ $self->chromosomes } ) {
-  #   for my $sample (@$sampleListAref) {
-  #     $personalDb->_getDbi( $chr, 0, 0, $sample, $nSamples );
-  #   }
-  # }
+  my $c = $personalDb->dbReadOne( $metaEnv, $metaDb, $metaKey );
+
+  my %completed = $c ? %$c : ();
+
+  if ( keys %completed == @$sampleListAref ) {
+    return;
+  }
+
+  for my $sample (@$sampleListAref) {
+    if ( $completed{$sample} ) {
+      next;
+    }
+
+    for my $chr ( @{ $self->chromosomes } ) {
+      $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
+    }
+  }
 
   # $personalDb->cleanUp();
   # undef $personalDb;
@@ -189,8 +212,7 @@ sub annotateFile {
   my $messageFreq = ( 2e4 / 4 ) * $self->maxThreads;
 
   # Report every 1e4 lines, to avoid thrashing receiver
-  my $progressFunc =
-  $self->makeDbWriter( \$abortErr, $outFh, $statsFh, $messageFreq, $sampleListAref );
+  my $progressFunc = $self->makeDbWriter( \%completed );
 
   MCE::Loop::init {
     max_workers => $self->maxThreads || 8,
@@ -275,8 +297,8 @@ sub annotateFile {
     my $chr;
     my @fields;
 
-    my @results;
-
+    #my @results;
+    my %seen;
     my %cursors = ();
 
     # GenPro::DBManager::initialize(
@@ -491,48 +513,44 @@ sub annotateFile {
 
         # Store whether het or not
         if ( $hets{$sample} ) {
-          # $het = 1;
+          $record[-1] = 1;
         } elsif ( $homs{$sample} ) {
-          $het = 0;
+          $record[-1] = 0;
         } else {
           next;
         }
 
+        $seen{$sample} //= 1;
+
         $cnt++;
-        push @samples, [ $het, $sample ];
+        # push @samples, [ $het, $sample ];
 
         # $personalDb->dbReadOne( $sample, $chr, $zeroPos );
 
         # Seems to work find
-        # $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
+        $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
 
         # Uncomment to test
         # my $val = $personalDb->dbReadOne( $sample, $chr, $zeroPos );
-        # p $val;
       }
 
       # If it becomes unsafe to use NOTLS and write from multiple processes
-      push @results, [ \@samples, $chr, $zeroPos, \@record ];
+      # push @results, [ \@samples, $chr, $zeroPos, \@record ];
 
-      if ( @results > 1024 ) {
-        $progressFunc->( \@results );
-        @results = ();
-      }
-    }
-    say STDERR "Done";
-
-    if (@results) {
-      $progressFunc->( \@results );
     }
 
-    # $personalDb->cleanAndWipeSingleton();
-    # undef $personalDb;
+    # say STDERR "Done";
+
+    MCE->gather( \%seen );
+
     close $MEM_FH;
   }
   $fh;
 
   # Force flush of output
-  $progressFunc->(undef);
+  # $progressFunc->(undef);
+
+  $personalDb->dbPut( $metaEnv, $metaDb, $metaKey, \%completed );
 
   MCE::Loop::finish();
 
@@ -571,61 +589,99 @@ sub annotateFile {
 }
 
 sub makeDbWriter {
-  my ( $self, $abortErrRef, $outFh, $statsFh, $throttleThreshold, $sampleListAref ) = @_;
+  my ( $self, $samplesSeenHref ) = @_;
 
-  # TODO: Convert genpro to Bystro track, give it its own db folder
-  GenPro::DBManager::initialize(
-    {
-      databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
-    }
-  );
+  # # TODO: Convert genpro to Bystro track, give it its own db folder
+  # GenPro::DBManager::initialize(
+  #   {
+  #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
+  #   }
+  # );
 
-  my $personalDb = GenPro::DBManager->new();
+  # my $personalDb = GenPro::DBManager->new();
+  # my $metaEnv    = 'stats';
+  # my $metaDb     = 'completed';
 
-  # Create the databases, 1 database per sample,
-  # and each sample database was 25 tables, 1 per chromosome
-  my $nChr = @{ $self->chromosomes };
-  # my $nSamples = @$sampleListAref;
-  for my $sample (@$sampleListAref) {
-    for my $chr ( @{ $self->chromosomes } ) {
-      $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
-    }
-  }
+  # $personalDb->_getDbi( $metaEnv, 0, 1, $metaDb, 10 );
 
-  my $totalAnnotated = 0;
-  my $totalSkipped   = 0;
+  # my %okToBuild;
+  # my %seen;
+  # # Create the databases, 1 database per sample,
+  # # and each sample database was 25 tables, 1 per chromosome
+  # my $nChr = @{ $self->chromosomes };
 
-  my $publish = $self->hasPublisher;
+  # my $toBuild = 0;
+  # my %completionMeta;
+  # # my $nSamples = @$sampleListAref;
+  # my $c = $personalDb->dbReadOne( $metaEnv, $metaDb, 'completed' );
 
-  my $thresholdAnn     = 0;
-  my $thresholdSkipped = 0;
+  # my %completed = $c ? %$c : ();
 
-  if ( !$throttleThreshold ) {
-    $throttleThreshold = 1e4;
-  }
+  # if ( keys %completed == @$sampleListAref ) {
+  #   return;
+  # }
 
-  my ( $sampleAref, $chr, $zeroPos, $recordAref );
+  # for my $sample (@$sampleListAref) {
+  #   if ( $completed{$sample} ) {
+  #     next;
+  #   }
+
+  #   for my $chr ( @{ $self->chromosomes } ) {
+  #     $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
+  #   }
+  # }
+
+  # my $totalAnnotated = 0;
+  # my $totalSkipped   = 0;
+
+  # my $publish = $self->hasPublisher;
+
+  # my $thresholdAnn     = 0;
+  # my $thresholdSkipped = 0;
+
+  # if ( !$throttleThreshold ) {
+  #   $throttleThreshold = 1e4;
+  # }
+  # say "Called";
+
+  # my ( $sampleAref, $chr, $zeroPos, $recordAref );
   return sub {
-    my ($resultsAref) = @_;
-    #my ( $sampleAref, $chr, $zeroPos, $recordAref ) = @_;
+    my $newSeen = shift;
 
-    if ( !$resultsAref ) {
-      # Could clean up here
-
-      $personalDb->cleanAndWipeSingleton();
-      return;
+    for my $sample ( keys %$newSeen ) {
+      $samplesSeenHref->{$sample} //= 1;
     }
+    # my ($resultsAref) = @_;
+    # #my ( $sampleAref, $chr, $zeroPos, $recordAref ) = @_;
 
-    for my $result (@$resultsAref) {
-      ( $sampleAref, $chr, $zeroPos, $recordAref ) = @$result;
+    # if ( !defined $resultsAref ) {
+    #   my $err = $personalDb->dbPut( $metaEnv, $metaDb, 'completed', \%seen );
 
-      for my $sample (@$sampleAref) {
-        $recordAref->[-1] = $sample->[0];
+    #   if ($err) {
+    #     $self->_errorWithCleanup($err);
+    #     return;
+    #   }
 
-        # Works to read
-        $personalDb->dbPatch( $sample->[1], $chr, 0, $zeroPos, $recordAref );
-      }
-    }
+    #   $personalDb->cleanAndWipeSingleton();
+    #   return;
+    # }
+
+    # for my $result (@$resultsAref) {
+    #   ( $sampleAref, $chr, $zeroPos, $recordAref ) = @$result;
+
+    #   for my $sample (@$sampleAref) {
+    #     $seen{ $sample->[1] } //= 1;
+
+    #     if ( $completed{$sample} ) {
+    #       next;
+    #     }
+
+    #     $recordAref->[-1] = $sample->[0];
+
+    #     # Works to read
+    #     $personalDb->dbPatch( $sample->[1], $chr, 0, $zeroPos, $recordAref );
+    #   }
+    # }
   }
 }
 
