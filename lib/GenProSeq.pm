@@ -57,6 +57,10 @@ with 'Seq::Definition', 'Seq::Role::Validator';
 
 has '+readOnly' => ( init_arg => undef, default => 1 );
 
+my $metaEnv = 'stats';
+my $metaDb  = 'completed';
+my $metaKey = 'sampleWritten';
+
 # TODO: further reduce complexity
 sub BUILD {
   my $self = shift;
@@ -109,16 +113,11 @@ sub annotate {
   #   my $message = shift;
   # };
 
-  if ( $fileType eq 'snp' ) {
-    $self->log( 'info', 'Beginning annotation' );
-    return $self->makePersonalProtDb('snp');
-  }
+  my $sampleListAref;
 
-  if ( $fileType eq 'vcf' ) {
-    $self->log( 'info', 'Beginning annotation' );
-    return $self->makePersonalProtDb('vcf');
-  }
+  ( $err, $sampleListAref ) = $self->makePersonalProtDb($fileType);
 
+  $self->step2($sampleListAref);
   # TODO: Inspect vcf header
 
   # TODO: support any other file, by checking the extension
@@ -165,9 +164,6 @@ sub makePersonalProtDb {
   );
 
   my $personalDb = GenPro::DBManager->new();
-  my $metaEnv    = 'stats';
-  my $metaDb     = 'completed';
-  my $metaKey    = 'sampleWritten';
 
   $personalDb->_getDbi( $metaEnv, 0, 1, $metaDb, 10 );
 
@@ -185,7 +181,7 @@ sub makePersonalProtDb {
   my %completed = $c ? %$c : ();
 
   if ( keys %completed == @$sampleListAref ) {
-    return;
+    return ( undef, $sampleListAref );
   }
 
   for my $sample (@$sampleListAref) {
@@ -262,20 +258,28 @@ sub makePersonalProtDb {
 
   my $exonicAlleleFuncIdx = $geneTrackGetter->{_alleleFuncFidx};
   my $codonNumIdx         = $geneTrackGetter->{_codonNumFidx};
-  my $refAaIdx            = $geneTrackGetter->{_refAaFidx};
-  my $altAaIdx            = $geneTrackGetter->{_altAaFidx};
-  my $descIdx             = $geneTrackGetter->{_featureIdxMap}{description};
-  my $nameIdx             = $geneTrackGetter->{_featureIdxMap}{name};
-  my $name2idx            = $geneTrackGetter->{_featureIdxMap}{name2};
-  my $codonPosIdx         = $geneTrackGetter->{_codonPosFidx};
+  # codon sequence seems to be only bit that we "merge" from reference db
+  # in GenPro_make_perprotdb2::ReadPerDb (MergePerDbEntriesToRecord)
+  # as used in var_prot_for_tx line 301 ($seq_of_per_prot{'-9'} = $variant_rec_href->{ref_seq};)
+  # and in var_prot_for_tx:
+  # for my $geno ( keys %seq_of_per_prot ) {
+  #      my @sites = split / /, $geno;
+  #      my @seq   = split //,  $seq_of_per_prot{$geno};
+  my $refCodonIdx = $geneTrackGetter->{_codonSidx};
+  my $refAaIdx    = $geneTrackGetter->{_refAaFidx};
+  my $altAaIdx    = $geneTrackGetter->{_altAaFidx};
+  my $descIdx     = $geneTrackGetter->{_featureIdxMap}{description};
+  my $nameIdx     = $geneTrackGetter->{_featureIdxMap}{name};
+  my $name2idx    = $geneTrackGetter->{_featureIdxMap}{name2};
+  my $codonPosIdx = $geneTrackGetter->{_codonPosFidx};
 
   # Defines feature insertion order
   # This defines what our per-user record looks like at any given position
   # Except we add 5 fields to beginning (chr, pos, type, ref, alt)
   # And 1 field to end (het/hom status
   my @wanted = (
-    $exonicAlleleFuncIdx, $codonNumIdx, $refAaIdx, $altAaIdx,
-    $descIdx, $nameIdx, $name2idx, $codonPosIdx
+    $exonicAlleleFuncIdx, $codonNumIdx, $refCodonIdx, $refAaIdx, $altAaIdx,
+    $nameIdx, $name2idx, $codonPosIdx
   );
 
   mce_loop_f {
@@ -299,8 +303,8 @@ sub makePersonalProtDb {
 
     #my @results;
     my %seen;
-    my %cursors = ();
-
+    my %cursors  = ();
+    my %pCursors = ();
     # GenPro::DBManager::initialize(
     #   {
     #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
@@ -380,27 +384,27 @@ sub makePersonalProtDb {
       # even features that have a 1 tx : M subfeatures (like spDisplayID) mapping
       # So all we need is the indices of the exonicAlleleFunction that are replacement
       my $func = $out[$exonicAlleleFuncIdx][0];
-
+      # p $func;
       # Check that we don't want stopGain, stopLoss, startGain, or spliceD/A
-      if ( !defined $func || ( !ref $func && $func ne $replacement ) ) {
+      if ( !defined $func || !( ref $func || $func eq $replacement ) ) {
         next;
       }
 
-      my $found = 0;
+      # Will be empty if $func eq $replacement
       my @ok;
-      for ( my $idx = 0 ; $idx < @$func ; $idx++ ) {
-        if ( !defined $func->[$idx] || $func->[$idx] ne $replacement ) {
-          push @ok, $idx;
-          next;
+      if ( ref $func ) {
+        my $found = 0;
+
+        for ( my $idx = 0 ; $idx < @$func ; $idx++ ) {
+          if ( defined $func->[$idx] && $func->[$idx] eq $replacement ) {
+            push @ok, $idx;
+            $found ||= 1;
+          }
         }
 
-        $found ||= 1;
-
-        # $idx++;
-      }
-
-      if ( !$found ) {
-        next;
+        if ( !$found ) {
+          next;
+        }
       }
 
       ################### What we aim to write ########################
@@ -417,18 +421,6 @@ sub makePersonalProtDb {
       #   ref_allele => $ref_allele,
       #   min_allele => $min_allele,
       # };
-
-      # WriteToDb( $id, $chr, $transcript_name, $record_href );
-      #                   }
-      #                 }
-      #               }
-      #             }
-      #             $dat_record_len -= $dat_typedef_size;
-      #           }
-      #         }
-      #       }
-      #     }
-      #   }
 
       # TODO: Optimize allocations
       # flexible features (such as description, not necessary for the Gene class)
@@ -453,9 +445,9 @@ sub makePersonalProtDb {
           $outIdx++;
         }
       } elsif ( @ok == 1 ) {
-        my $txIdx = @ok;
-
+        my $txIdx  = $ok[0];
         my $outIdx = 5;
+
         for my $fIdx (@wanted) {
           # 0 because non-indels have only 1 position index
           $record[$outIdx] = $out[$fIdx][0][$txIdx];
@@ -463,6 +455,7 @@ sub makePersonalProtDb {
         }
       } else {
         my $seenFirst;
+
         for my $txIdx (@ok) {
 
           if ( !$seenFirst ) {
@@ -505,6 +498,7 @@ sub makePersonalProtDb {
       my @samples;
       my $het = 1;
 
+
       for my $sample (@$sampleListAref) {
         if ( $cnt == $max ) {
           # say STDERR "count is $cnt and max is $max: $line";
@@ -520,6 +514,12 @@ sub makePersonalProtDb {
           next;
         }
 
+        # if ( !( $pCursors{$sample} && $pCursors{$sample}{$chr} ) ) {
+        #   $pCursors{$sample} //= {};
+
+        #   $pCursors{$sample}{$chr} = $personalDb->dbStartCursorTxn( $sample, $chr );
+        # }
+
         $seen{$sample} //= 1;
 
         $cnt++;
@@ -527,7 +527,12 @@ sub makePersonalProtDb {
 
         # $personalDb->dbReadOne( $sample, $chr, $zeroPos );
 
-        # Seems to work find
+
+        #my (  $cursor, $chr, $trackKey, $pos, $newValue, $mergeFunc) = @_;
+        # $personalDb->dbPatchCursorUnsafe( $pCursors{$sample}{$chr},
+        #   $chr, 0, $zeroPos, \@record );
+
+        # seems to work fine
         $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
 
         # Uncomment to test
@@ -540,6 +545,11 @@ sub makePersonalProtDb {
     }
 
     # say STDERR "Done";
+
+    # for my $sample (@$sampleListAref) {
+    #   $personalDb->dbEndCursorTxn($sample);
+    # }
+    # $personalDb->dbEndCursorTxn()
 
     MCE->gather( \%seen );
 
@@ -585,103 +595,120 @@ sub makePersonalProtDb {
 
   $db->cleanUp();
 
-  return ( $err, $self->outputFilesInfo );
+  return ( $err, $sampleListAref );
+}
+
+# Read reference, personal db, make fasta
+
+# In old Genpro:
+# 1) ReadRefProt would populate refprots, by
+# txID => txData (what was stored in our db, like the codon sequence)
+# 2) Populate $idListAref, [sampleId1,...]
+# 3) MakeVarProt(dbPath, outPath, idListAref, outDbName)
+
+# MakeVarProt takes the path of the personal db we made in step1
+# and creates a personal protein database for each sample id passed to it
+# for each id, for each chr: my $per_rec_aref = ReadPerDb( $path_db, $id, $chr );
+# Not 100% sure what ReadPerDb does, because it is "merging" records from
+# the reference database, but why don't we just store all of that in the
+# personal db, maybe too big? In that case, ReadPerDb can be replicated
+# by either readng the gene track, or doing a refseq db lookup ourselfves
+
+# 3) The meat: var_prot_for_tx : generate all permutations
+# var_prot_for_tx takes a "merged" personal protein record
+# and returns an array of all variant proteins
+# $seq_of_per_prot{'-9'} = $variant_rec_href->{ref_seq};
+#  my $aa_residues_aref = $variant_rec_href->{aa_residue};
+#  my $old_aas_aref     = $variant_rec_href->{old_aa};
+#  my $new_aas_aref     = $variant_rec_href->{new_aa};
+
+# We then iterate over all amino acids (replacement) at this site
+#   my $aa_residues_aref = $variant_rec_href->{aa_residue};
+# my $old_aas_aref     = $variant_rec_href->{old_aa};
+# my $new_aas_aref     = $variant_rec_href->{new_aa};
+
+# # here, we are limiting the number of permutations to be done in a reasonable
+# # time, recall how large 20!, we will still be making all substitutions on
+# # the protein afterward
+# if ( scalar @{ $variant_rec_href->{new_aa} } < 21 ) {
+#   my $last_site = 1;
+
+#   for ( my $i = 0; $i < @$aa_residues_aref; $i++ ) {
+#     my $site   = $aa_residues_aref->[$i];
+#     my $new_aa = $new_aas_aref->[$i];
+
+# Then we start iterating over the seuqnce
+# The first time the key is -9, aka the refernce
+# for my $geno ( keys %seq_of_per_prot ) {
+# my @sites = split / /, $geno;
+# my @seq   = split //,  $seq_of_per_prot{$geno};
+# my $old_aa = $seq[ $site - 1 ];
+
+# not sure whether prot_seq here is just the codon sequence
+# from reference db
+# my $prot_record_href = $refprots{$tx};
+# if ( !defined $prot_record_href ) {
+#   Log( "Fatal", "Could not find $tx in ref prot db - did you load refprot?" );
+# }
+
+# my $ref_seq    = $prot_record_href->{prot_seq};
+# my $ref_strand = $prot_record_href->{strand};
+
+sub step2 {
+
+  my $self           = shift;
+  my $sampleListAref = shift;
+
+  my $err;
+
+  GenPro::DBManager::initialize(
+    {
+      databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
+    }
+  );
+
+  my $personalDb = GenPro::DBManager->new();
+
+  # Report every 1e4 lines, to avoid thrashing receiver
+  my $progressFunc = sub {
+
+  };
+
+  MCE::Loop::init {
+    max_workers => $self->maxThreads || 8,
+
+    # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
+    # so accumulate less than we would if processing full .snp
+    chunk_size => 1,
+    gather     => $progressFunc,
+  };
+
+  mce_loop {
+    my ( $mce, $chunk_ref, $chunk_id ) = @_;
+
+    my $sample = $_;
+
+    for my $chr ( @{ $self->chromosomes } ) {
+      my $dataAref = $personalDb->dbReadAll( $sample, $chr, );
+    }
+
+  }
+  @$sampleListAref;
+
+  MCE::Loop::finish();
+
+  return ($err);
 }
 
 sub makeDbWriter {
   my ( $self, $samplesSeenHref ) = @_;
 
-  # # TODO: Convert genpro to Bystro track, give it its own db folder
-  # GenPro::DBManager::initialize(
-  #   {
-  #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
-  #   }
-  # );
-
-  # my $personalDb = GenPro::DBManager->new();
-  # my $metaEnv    = 'stats';
-  # my $metaDb     = 'completed';
-
-  # $personalDb->_getDbi( $metaEnv, 0, 1, $metaDb, 10 );
-
-  # my %okToBuild;
-  # my %seen;
-  # # Create the databases, 1 database per sample,
-  # # and each sample database was 25 tables, 1 per chromosome
-  # my $nChr = @{ $self->chromosomes };
-
-  # my $toBuild = 0;
-  # my %completionMeta;
-  # # my $nSamples = @$sampleListAref;
-  # my $c = $personalDb->dbReadOne( $metaEnv, $metaDb, 'completed' );
-
-  # my %completed = $c ? %$c : ();
-
-  # if ( keys %completed == @$sampleListAref ) {
-  #   return;
-  # }
-
-  # for my $sample (@$sampleListAref) {
-  #   if ( $completed{$sample} ) {
-  #     next;
-  #   }
-
-  #   for my $chr ( @{ $self->chromosomes } ) {
-  #     $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
-  #   }
-  # }
-
-  # my $totalAnnotated = 0;
-  # my $totalSkipped   = 0;
-
-  # my $publish = $self->hasPublisher;
-
-  # my $thresholdAnn     = 0;
-  # my $thresholdSkipped = 0;
-
-  # if ( !$throttleThreshold ) {
-  #   $throttleThreshold = 1e4;
-  # }
-  # say "Called";
-
-  # my ( $sampleAref, $chr, $zeroPos, $recordAref );
   return sub {
     my $newSeen = shift;
 
     for my $sample ( keys %$newSeen ) {
       $samplesSeenHref->{$sample} //= 1;
     }
-    # my ($resultsAref) = @_;
-    # #my ( $sampleAref, $chr, $zeroPos, $recordAref ) = @_;
-
-    # if ( !defined $resultsAref ) {
-    #   my $err = $personalDb->dbPut( $metaEnv, $metaDb, 'completed', \%seen );
-
-    #   if ($err) {
-    #     $self->_errorWithCleanup($err);
-    #     return;
-    #   }
-
-    #   $personalDb->cleanAndWipeSingleton();
-    #   return;
-    # }
-
-    # for my $result (@$resultsAref) {
-    #   ( $sampleAref, $chr, $zeroPos, $recordAref ) = @$result;
-
-    #   for my $sample (@$sampleAref) {
-    #     $seen{ $sample->[1] } //= 1;
-
-    #     if ( $completed{$sample} ) {
-    #       next;
-    #     }
-
-    #     $recordAref->[-1] = $sample->[0];
-
-    #     # Works to read
-    #     $personalDb->dbPatch( $sample->[1], $chr, 0, $zeroPos, $recordAref );
-    #   }
-    # }
   }
 }
 

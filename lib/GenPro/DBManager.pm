@@ -414,10 +414,11 @@ sub dbPatch {
 
       # TODO: is this right? Should we set the val to undef?
       # Nothing to update
-      # if ( !defined $aref->[ $_[3] ] ) {
-      #   # return 0;
-      # }
-      $write = 0;
+      if ( !defined $aref->[ $_[3] ] ) {
+        $write = 0;
+      } else {
+        $write = 1;
+      }
     } else {
       # If we return here, the environemnt just dissapears, not sure why
       # Even though we don't commit, seems it should be ok?
@@ -559,16 +560,16 @@ sub dbDelete {
 #cursor version
 # Read transactions are by default not committed
 sub dbReadAll {
-  my ( $self, $chr, $skipCommit, $stringKeys ) = @_;
+  my ( $self, $envName, $dbName, $skipCommit, $stringKeys ) = @_;
 
   #==   $_[0], $_[1], $_[2]
 
   #It is possible not to find a database in dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
   #http://ideone.com/uzpdZ8
-  my $db = $self->_getDbi( $chr, 0, $stringKeys ) or return;
+  my $db = $self->_getDbi( $envName, 0, $stringKeys, $dbName ) or return;
 
   if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
+    $db->{db}->Txn = $db->{env}->BeginTxn();
 
     # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
     $db->{db}->Txn->AutoCommit(1);
@@ -618,7 +619,7 @@ sub dbReadAll {
     $LMDB_File::last_err = 0;
   }
 
-  return \@out;
+  return @out ? \@out : undef;
 }
 
 # Delete all values within a database; a necessity if we want to update a single track
@@ -714,60 +715,68 @@ sub dbStartCursorTxn {
     return 255;
   }
 
+  # TODO: Investigate why a subtransaction isn't successfully made
+  # when using BeginTxn()
+  # If we create a txn and assign it to DB->Txn, from $db->{db}->Txn->env, before creating a txn here
+  # upon trying to use the parent transaction, we will get a crash (-30782 / BAD_TXN)
+  # no such issue arises the other way around; i.e creating this transaction, then having
+  # a normal DB->Txn created as a nested transaction
+  if ( $db->{db}->Alive ) {
+    $self->_errorWithCleanup(
+      "DB alive when calling dbStartCursorTxn,
+        LMDB_File allows only 1 txn per environment.
+        Commit DB->Txn before dbStartCursorTxn"
+    );
+
+    return 255;
+  }
+
   $cursors{$envName} //= {
     txn     => undef,
     cursors => {},
   };
 
-  # if ( !( $cursors{$envName} && $cursors{$envName}{txn} ) ) {
-  #   # TODO: Investigate why a subtransaction isn't successfully made
-  #   # when using BeginTxn()
-  #   # If we create a txn and assign it to DB->Txn, from $db->{db}->Txn->env, before creating a txn here
-  #   # upon trying to use the parent transaction, we will get a crash (-30782 / BAD_TXN)
-  #   # no such issue arises the other way around; i.e creating this transaction, then having
-  #   # a normal DB->Txn created as a nested transaction
-  #   if ( $db->{db}->Alive ) {
-  #     $self->_errorWithCleanup(
-  #       "DB alive when calling dbStartCursorTxn,
-  #       LMDB_File allows only 1 txn per environment.
-  #       Commit DB->Txn before dbStartCursorTxn"
-  #     );
 
-  #     return 255;
-  #   }
+  if ( !( $cursors{$envName} && $cursors{$envName}{txn} ) ) {
 
-  #   # Will throw errors saying "should be nested transaction" unlike env->BeginTxn();
-  #   # to protect against the above BAD_TXN issue
-  #   # my $txn = LMDB::Txn->new( ${ $db->{env} }, $db->{tflags} );
 
-  #   $txn->AutoCommit(1);
+    # Will throw errors saying "should be nested transaction" unlike env->BeginTxn();
+    # to protect against the above BAD_TXN issue
+    my $txn = LMDB::Txn->new( $db->{env}, $db->{tflags} );
 
-  #   # $cursors{$envName}{txn} = $txn;
-  # }
+    $txn->AutoCommit(1);
+
+    $cursors{$envName}{txn} = $txn;
+  }
 
   # my $txn = $cursors{$envName}{txn};
+  my $txn = $cursors{$envName}{txn};    #->SubTxn( $db->{tflags} );
+                                        # $txn->AutoCommit(1);
 
-  my $txn = $db->{env}->BeginTxn( $db->{tflags} );
-  $txn->AutoCommit(1);
-  # p $txn;
-  # p $subTxn;
-  # This means LMDB_File will not track our cursor, must close/delete manually
-  LMDB::Cursor::open( $txn, $db->{dbi}, my $cursor );
+  my $DB = LMDB_File->new( $txn, $db->{dbi} );
 
-  # TODO: better error handling
+  my $cursor = $DB->Cursor;
+
+
+  # # p $txn;
+  # # p $subTxn;
+  # # This means LMDB_File will not track our cursor, must close/delete manually
+  # LMDB::Cursor::open( $cursors{$envName}{txn}, $db->{dbi}, my $cursor );
+
+  # # TODO: better error handling
   if ( !$cursor ) {
     $self->_errorWithCleanup("Couldn't open cursor for $_[1]");
     return 255;
   }
 
-  # Unsafe, private LMDB_File method access but Cursor::open does not track cursors
+  # # Unsafe, private LMDB_File method access but Cursor::open does not track cursors
   # $LMDB::Txn::Txns{$$txn}{Cursors}{$$cursor} = 1;
 
   $cursors{$envName}{cursors}{$namedDb} = [ $txn, $cursor ];
 
-  # We store data in sequential, integer order
-  # in all but the meta tables, which don't use this function
-  # LMDB::Cursor::open($txn, $db->{dbi}, my $cursor);
+  # # We store data in sequential, integer order
+  # # in all but the meta tables, which don't use this function
+  # # LMDB::Cursor::open($txn, $db->{dbi}, my $cursor);
   return $cursors{$envName}{cursors}{$namedDb};
 }
 
@@ -838,10 +847,12 @@ sub dbPatchCursorUnsafe {
   #    $_[0]. $_[1].   $_[2]. $_[3].  $_[4] $_[5].     $_[6]
 
   #$cursor->[1]->_get($pos, my $json, MDB_SET);
+  p $_[1];
   $_[1]->[1]->_get( $_[4], my $json, MDB_SET );
 
   my $existingValue = defined $json ? $mp->unpack($json) : [];
 
+  my $write = 1;
   #                            [$trackKey]
   if ( defined $existingValue->[ $_[3] ] ) {
 
@@ -859,8 +870,12 @@ sub dbPatchCursorUnsafe {
       }
 
       # nothing to do; no value returned
+      # Leads to strange issues, Error 22 / EINVAL or environment closes
+      # if return without committing read transaction with NOTLS
       if ( !defined $existingValue->[ $_[3] ] ) {
-        return 0;
+        $write = 0;
+      } else {
+        $write = 1;
       }
     } else {
 
@@ -868,7 +883,8 @@ sub dbPatchCursorUnsafe {
       # just like dbPatch, but no overwrite option
       # Overwrite is impossible when mergeFunc is defined
       # TODO: remove overwrite from dbPatch
-      return 0;
+      #return 0;
+      $write = 0;
     }
   } else {
 
@@ -876,16 +892,18 @@ sub dbPatchCursorUnsafe {
     $existingValue->[ $_[3] ] = $_[5];
   }
 
-  #_put as used here will not return errors if the cursor is inactive
-  # hence, "unsafe"
-  if ( defined $json ) {
+  if ($write) {
+    #_put as used here will not return errors if the cursor is inactive
+    # hence, "unsafe"
+    if ( defined $json ) {
 
-    #$cursor->[1]->_put($pos, $mp->pack($existingValue), MDB_CURRENT);
-    $_[1]->[1]->_put( $_[4], $mp->pack($existingValue), MDB_CURRENT );
-  } else {
+      #$cursor->[1]->_put($pos, $mp->pack($existingValue), MDB_CURRENT);
+      $_[1]->[1]->_put( $_[4], $mp->pack($existingValue), MDB_CURRENT );
+    } else {
 
-    #$cursor->[1]->_put($pos, $mp->pack($existingValue));
-    $_[1]->[1]->_put( $_[4], $mp->pack($existingValue) );
+      #$cursor->[1]->_put($pos, $mp->pack($existingValue));
+      $_[1]->[1]->_put( $_[4], $mp->pack($existingValue) );
+    }
   }
 
   if ($LMDB_File::last_err) {
@@ -1181,7 +1199,7 @@ sub _getDbi {
     env    => $envs{$name}{env},
   };
 
-  # say STDERR "Opened $name:$namedDb";
+  $envs{$name}{txn} = 0;
 
   return $envs{$name}{dbs}{$namedDb};
 }
