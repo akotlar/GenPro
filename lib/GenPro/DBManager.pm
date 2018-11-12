@@ -135,6 +135,8 @@ my $mp = Data::MessagePack->new()->prefer_integer()->prefer_float32();
 ################### DB Read, Write methods ############################
 # Unsafe for $_[2] ; will be modified if an array is passed
 # Read transactions are committed by default
+
+# Deprecated
 sub dbReadOne {
 
   #my ($self, $envName, $dbName,$zeroPos, $skipCommit, $stringKeys,) = @_;
@@ -170,47 +172,40 @@ sub dbReadOne {
   return defined $json ? $mp->unpack($json) : undef;
 }
 
-# Unsafe for $_[2] ; will be modified if an array is passed
-# Read transactions are committed by default
-sub dbRead {
+##### Raw methods
+sub dbReadOneRaw {
+  #my ($self, $txn, $dbi, $pos) = @_;
+  #           $_[1], $_[2], $_[3];
 
-  #my ($self, $chr, $posAref, $skipCommit, $stringKeys) = @_;
-  #== $_[0], $_[1], $_[2],    $_[3],       $_[4] (don't assign to avoid copy)
-  if ( !ref $_[2] ) {
-    goto &dbReadOne;
+  $_[1]->get( $_[2], $_[3], my $json );
+
+  return defined $json ? $mp->unpack($json) : undef;
+}
+
+# Simplified dbRead: Takes a transaction from an already-opened database
+# You manage your own commit
+# Mutates the passed in array of positions
+sub dbReadRaw {
+  #my ($self, $txn, $dbi, $posAref) = @_;
+  #           $_[1], $_[2], $_[3]
+
+  if ( !ref $_[3] ) {
+    goto &dbReadOneRaw;
   }
 
-  #It is possible not to find a database in dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
-  #http://ideone.com/uzpdZ8
-  #                      #$name, $dontCreate, $stringKeys
-  my $db = $_[0]->_getDbi( $_[1], 0, $_[4] ) or return [];
-  my $dbi = $db->{dbi};
-
-  if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
-
-    # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
-    $db->{db}->Txn->AutoCommit(1);
-  }
-
-  my $txn = $db->{db}->Txn;
-
+  # Modifies $posAref ($_[3]) to avoid extra allocation
   my $json;
-
-  # Modifies $posAref ($_[2]) to avoid extra allocation
-  for my $pos ( @{ $_[2] } ) {
-    $txn->get( $dbi, $pos, $json );
+  for my $pos ( @{ $_[3] } ) {
+    #$txn       $dbi
+    $_[1]->get( $_[2], $pos, $json );
 
     $pos = defined $json ? $mp->unpack($json) : undef;
   }
 
-  # Commit unless the user specifically asks not to
-  #if(!$skipCommit) {
-  $txn->commit() unless $_[3];
-
   #substantial to catch any errors
   if ($LMDB_File::last_err) {
     if ( $LMDB_File::last_err != MDB_NOTFOUND ) {
+      #$self
       $_[0]->_errorWithCleanup("dbRead LMDB error after loop: $LMDB_File::last_err");
       return 255;
     }
@@ -220,8 +215,23 @@ sub dbRead {
   }
 
   #will return a single value if we were passed one value
-  #return \@out;
-  return $_[2];
+  #return $posAref;
+  return $_[3];
+}
+
+sub getTxn {
+  my ($self, $db);
+
+  my $dbi = $db->{dbi};
+
+  if ( !$db->{db}->Alive ) {
+    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
+
+    # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
+    $db->{db}->Txn->AutoCommit(1);
+  }
+
+  return $db->{db}->Txn;
 }
 
 #Assumes that the posHref is
@@ -737,9 +747,7 @@ sub dbStartCursorTxn {
   };
 
 
-  if ( !( $cursors{$envName} && $cursors{$envName}{txn} ) ) {
-
-
+  if ( !$cursors{$envName}{txn} ) {
     # Will throw errors saying "should be nested transaction" unlike env->BeginTxn();
     # to protect against the above BAD_TXN issue
     my $txn = LMDB::Txn->new( $db->{env}, $db->{tflags} );
@@ -749,19 +757,19 @@ sub dbStartCursorTxn {
     $cursors{$envName}{txn} = $txn;
   }
 
-  # my $txn = $cursors{$envName}{txn};
-  my $txn = $cursors{$envName}{txn};    #->SubTxn( $db->{tflags} );
-                                        # $txn->AutoCommit(1);
+  # # my $txn = $cursors{$envName}{txn};
+  # my $txn = $cursors{$envName}{txn};    #->SubTxn( $db->{tflags} );
+  #                                       # $txn->AutoCommit(1);
 
-  my $DB = LMDB_File->new( $txn, $db->{dbi} );
+  # my $DB = LMDB_File->new( $txn, $db->{dbi} );
 
-  my $cursor = $DB->Cursor;
+  # my $cursor = $DB->Cursor;
 
 
   # # p $txn;
   # # p $subTxn;
   # # This means LMDB_File will not track our cursor, must close/delete manually
-  # LMDB::Cursor::open( $cursors{$envName}{txn}, $db->{dbi}, my $cursor );
+  LMDB::Cursor::open( $cursors{$envName}{txn}, $db->{dbi}, my $cursor );
 
   # # TODO: better error handling
   if ( !$cursor ) {
@@ -772,7 +780,7 @@ sub dbStartCursorTxn {
   # # Unsafe, private LMDB_File method access but Cursor::open does not track cursors
   # $LMDB::Txn::Txns{$$txn}{Cursors}{$$cursor} = 1;
 
-  $cursors{$envName}{cursors}{$namedDb} = [ $txn, $cursor ];
+  $cursors{$envName}{cursors}{$namedDb} = [ undef, $cursor ];
 
   # # We store data in sequential, integer order
   # # in all but the meta tables, which don't use this function
@@ -956,12 +964,16 @@ sub dbEndCursorTxn {
 
   for my $cursor ( values %{ $cursors{$envName}{cursors} } ) {
     $cursor->[1]->close();
-    # $cursor->[0]->commit();
+    # Right now we don't have subtxn's, I don't really know how to fix it
+    # Without using the LMDB_File->new() way
+    # Not sure also what the benefits of subtxn's are...is it benefit of locks?
+    if(defined $cursor->[0]) {
+      $cursor->[0]->commit();
+    }
   }
 
-  # closes a write cursor as well; the above $cursor->close() is to be explicit
-  # will not close a MDB_RDONLY cursor
-  # $cursors{$envName}{txn}->commit();
+  # The parent txn
+  $cursors{$envName}{txn}->commit();
 
   delete $cursors{$envName};
 
@@ -1065,6 +1077,8 @@ sub dbDropDatabase {
   $instanceConfig{databaseDir}->child($chr)->remove_tree();
 }
 
+# We should really make this public and the return object from this
+# to be required in any methods
 sub _getDbi {
 
   # Exists and not defined, because in read only database we may discovercea
@@ -1095,7 +1109,7 @@ sub _getDbi {
   }
 
   if ( !$envs{$name}{env} ) {
-    $maxDbs //= 25;
+    $maxDbs //= 0;
 
     # Maximum db size
     # This * # of environments must be < 2^48 or maybe 2^47
@@ -1174,7 +1188,7 @@ sub _getDbi {
 
   if ($LMDB_File::last_err) {
     $self->_errorWithCleanup(
-      "Failed to open database $name:$namedDb for 
+      "Failed to open database $name:$namedDb for
       $instanceConfig{databaseDir} beacuse of $LMDB_File::last_err"
     );
     return;

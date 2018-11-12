@@ -76,7 +76,7 @@ die "Usage: $0
     [--name <output database name, defaults to id]
     [--max <max peptide length, default: $max_peptide_length>]
     [--min <min peptide length, default: $min_peptide_length>]\n"
-  unless GetOptions(
+unless GetOptions(
   'v|verbose'   => \$verbose,
   'd|db=s'      => \$dir_db,
   'r|ref=s'     => \$dir_ref_prot,
@@ -87,11 +87,11 @@ die "Usage: $0
   'max=n'       => \$max_peptide_length,
   'min=n'       => \$min_peptide_length,
   'debug'       => \$debug,
-  )
-  and $dir_db
-  and $dir_ref_prot
-  and $dir_out
-  and ( ( $idListFile and $outDbName ) or $id );
+)
+and $dir_db
+and $dir_ref_prot
+and $dir_out
+and ( ( $idListFile and $outDbName ) or $id );
 
 # check - output directory
 my $path_out = path($dir_out);
@@ -120,24 +120,19 @@ Log( "Finished reading reference protein entries", $path_ref_prot->stringify() )
 
 if ( defined $idListFile ) {
   $idListAref = readIdList($idListFile);
-}
-else {
+} else {
   $idListAref = [$id];
   if ( !defined $outDbName ) {
     $outDbName = $id;
   }
 }
 Log(
-  sprintf(
-    "Started creating personal protein entries for %s",
-    join ", ", @$idListAref
-  )
+  sprintf( "Started creating personal protein entries for %s", join ", ", @$idListAref )
 );
 MakeVarProt( $path_db, $path_out, $idListAref, $outDbName );
 Log(
   sprintf(
-    "Finished creating personal protein entries for  %s",
-    join ", ", @$idListAref
+    "Finished creating personal protein entries for  %s", join ", ", @$idListAref
   )
 );
 
@@ -272,10 +267,10 @@ sub sort_by_uniq_peptides {
 
   my @s_records;
   my @s_records_with_count = sort { $b->[0] <=> $a->[0] }
-    map { [ new_global_peptide( $_->{seq} ), $_ ] } @records;
+  map { [ new_global_peptide( $_->{seq} ), $_ ] } @records;
 
   # only want records if they contribute unique peptides
-  for ( my $i = 0; $i < @s_records_with_count; $i++ ) {
+  for ( my $i = 0 ; $i < @s_records_with_count ; $i++ ) {
     if ( $s_records_with_count[$i]->[0] > 0 ) {
       push @s_records, $s_records_with_count[$i]->[1];
     }
@@ -309,7 +304,8 @@ sub var_prot_for_tx {
   if ( scalar @{ $variant_rec_href->{new_aa} } < 21 ) {
     my $last_site = 1;
 
-    for ( my $i = 0; $i < @$aa_residues_aref; $i++ ) {
+    # aa_residue is the codon number
+    for ( my $i = 0 ; $i < @$aa_residues_aref ; $i++ ) {
       my $site   = $aa_residues_aref->[$i];
       my $new_aa = $new_aas_aref->[$i];
 
@@ -359,18 +355,15 @@ sub var_prot_for_tx {
             seq  => $seq_str,
           };
           push @records, $href;
-        }
-        elsif ( $geno eq "-9" ) {
+        } elsif ( $geno eq "-9" ) {
           next;
-        }
-        else {
+        } else {
           delete $seq_of_per_prot{$geno};
         }
       }
       $last_site = $site;
     }
-  }
-  else {
+  } else {
     my $msg = sprintf(
       "skipping permutations for %s due to %d sites",
       $variant_rec_href->{name},
@@ -384,7 +377,7 @@ sub var_prot_for_tx {
   if ( !exists $seq_of_per_prot{$all_geno} ) {
     Log("making a protein with all genotypes");
     my @seq = split //, $seq_of_per_prot{'-9'};
-    for ( my $i = 0; $i < @$aa_residues_aref; $i++ ) {
+    for ( my $i = 0 ; $i < @$aa_residues_aref ; $i++ ) {
       my $site   = $aa_residues_aref->[$i];
       my $new_aa = $new_aas_aref->[$i];
       my $old_aa = $seq[ $site - 1 ];
@@ -419,11 +412,9 @@ sub var_prot_for_tx {
 
   if (wantarray) {
     return @records;
-  }
-  elsif ( defined wantarray ) {
+  } elsif ( defined wantarray ) {
     return \@records;
-  }
-  else {
+  } else {
     die "var_prot_for_tx() should be called in the list or scalar context";
   }
 }
@@ -566,7 +557,7 @@ sub checkObsExpAaInTxSeq {
   my $old_aa_aref     = $var_rec->{old_aa};
   my @ref_seq         = split //, $var_rec->{ref_seq};
 
-  for ( my $i = 0; $i < @$aa_residue_aref; $i++ ) {
+  for ( my $i = 0 ; $i < @$aa_residue_aref ; $i++ ) {
     # from tx
     my $obs_aa = $ref_seq[ $aa_residue_aref->[$i] - 1 ];
     # from perdb
@@ -584,7 +575,7 @@ sub checkObsExpAaInTxSeq {
 
     if ( $obs_aa ne $exp_aa ) {
       my $msg =
-        sprintf( "Discordant expected '%s' and observed AA '%s' for site %d for %s",
+      sprintf( "Discordant expected '%s' and observed AA '%s' for site %d for %s",
         $obs_aa, $exp_aa, $i + 1, $var_rec->{name} );
       Log( "Error", $msg, dump($var_rec), string_protein( $var_rec, $i ) );
     }
@@ -610,16 +601,16 @@ sub variant_sites {
   my $min_allele_aref = $per_rec_href->{min_allele};
   my $codon_pos_aref  = $per_rec_href->{codon_pos};
 
-  for ( my $i = 0; $i < @$aa_residue_aref; $i++ ) {
+  for ( my $i = 0 ; $i < @$aa_residue_aref ; $i++ ) {
     my $aa_residue = $aa_residue_aref->[$i];
     if ( exists $geno_present{$aa_residue} ) {
       my $c_site = ( 3 * $aa_residue ) + $codon_pos_aref->[$i];
       push @{ $m{c_changes} },
-        sprintf( "c.%d%s>%s", $c_site, $ref_allele_aref->[$i], $min_allele_aref->[$i] );
+      sprintf( "c.%d%s>%s", $c_site, $ref_allele_aref->[$i], $min_allele_aref->[$i] );
       push @{ $m{p_changes} },
-        sprintf( "p.%d%s>%s", $aa_residue, $old_aa_aref->[$i], $new_aa_aref->[$i] );
+      sprintf( "p.%d%s>%s", $aa_residue, $old_aa_aref->[$i], $new_aa_aref->[$i] );
       push @{ $m{g_changes} },
-        sprintf( "g.%d%s>%s",
+      sprintf( "g.%d%s>%s",
         $chr_pos_aref->[$i],
         $ref_allele_aref->[$i],
         $min_allele_aref->[$i] );
@@ -679,16 +670,20 @@ sub recToFastaEntry {
   ( my $seq = $href->{prot_seq} ) =~ s/$trim_end_regex//xm;
 
   if ( $href->{ref_prot} == 1 ) {
-    return ( $seq,
-      sprintf( ">%s %s\n%s", $href->{id}, join( $rec_sep, ( "ref_prot", @array ) ), $seq )
+    return (
+      $seq,
+      sprintf(
+        ">%s %s\n%s", $href->{id}, join( $rec_sep, ( "ref_prot", @array ) ), $seq
+      )
     );
-  }
-  elsif ( $href->{ref_prot} == 0 ) {
-    return ( $seq,
-      sprintf( ">%s %s\n%s", $href->{id}, join( $rec_sep, ( "var_prot", @array ) ), $seq )
+  } elsif ( $href->{ref_prot} == 0 ) {
+    return (
+      $seq,
+      sprintf(
+        ">%s %s\n%s", $href->{id}, join( $rec_sep, ( "var_prot", @array ) ), $seq
+      )
     );
-  }
-  else {
+  } else {
     my $msg = "Error writing fasta for: " . dump($href);
     croak $msg;
   }
@@ -718,10 +713,10 @@ sub WritePerProt {
   # reference protein
   for my $protId ( sort keys %refprots ) {
     my ( $seq, $entry_str ) =
-      recToFastaEntry( $refprots{$protId}, \@notInHeader, $sep_char );
+    recToFastaEntry( $refprots{$protId}, \@notInHeader, $sep_char );
     if ( exists $prnSeq{$seq} ) {
-      my $msg = sprintf(
-        "Exact _reference_ protein previously found in '%s' for '%s'... skipping.",
+      my $msg =
+      sprintf( "Exact _reference_ protein previously found in '%s' for '%s'... skipping.",
         $prnSeq{$seq}, $protId );
       Log( "Debug", $msg );
       next;
@@ -738,7 +733,7 @@ sub WritePerProt {
     my ( $seq, $entry_str ) = recToFastaEntry( $r_href, \@notInHeader, $sep_char );
     if ( exists $prnSeq{$seq} ) {
       my $msg =
-        sprintf( "Exact _variant_ protein previously found in '%s' for '%s'... skipping.",
+      sprintf( "Exact _variant_ protein previously found in '%s' for '%s'... skipping.",
         $prnSeq{$seq}, $r_href->{id} );
       Log($msg);
       next;
@@ -770,14 +765,13 @@ sub string_protein {
     $var_rec_href->{name}, $site, scalar @ref_seq );
 
   $msg .= "'";
-  for ( my $j = 0; $j < @ref_seq; $j++ ) {
+  for ( my $j = 0 ; $j < @ref_seq ; $j++ ) {
     if ( $j % 80 == 0 && $j != 0 ) {
       $msg .= "\n";
     }
     if ( $j == $site - 1 ) {
       $msg .= ". ";
-    }
-    elsif ( $j == $site + 1 ) {
+    } elsif ( $j == $site + 1 ) {
       $msg .= " .";
     }
     $msg .= $ref_seq[$j];
@@ -796,8 +790,7 @@ sub new_global_peptide {
   my %trp_peptides = Trypsin($seq);
   if ( !%trp_peptides ) {
     return $existing_peptide_count;
-  }
-  else {
+  } else {
     for my $pep ( values %trp_peptides ) {
       if ( !exists $trpPepDb{$pep} ) {
         $existing_peptide_count++;
@@ -824,7 +817,7 @@ sub Trypsin {
   my @peptide = split( //, $peptide );
   my @cut_sites;
   my $last_cut_site = 0;
-  for ( my $i = 0; $i < @peptide; $i++ ) {
+  for ( my $i = 0 ; $i < @peptide ; $i++ ) {
     if ( CutAa( $peptide[$i] ) ) {
       push @cut_sites, $i + 1;
       $last_cut_site = $i + 1;
@@ -840,7 +833,7 @@ sub Trypsin {
   # reset
   $last_cut_site = 0;
 
-  for ( my $i = 0; $i < @cut_sites; $i++ ) {
+  for ( my $i = 0 ; $i < @cut_sites ; $i++ ) {
     my $start = $last_cut_site;
     my $end   = $cut_sites[$i];
     my $seq   = join "", @peptide[ $start .. $end - 1 ];
@@ -870,11 +863,9 @@ sub Trypsin {
   }
   if (wantarray) {
     return %digest;
-  }
-  elsif ( defined wantarray ) {
+  } elsif ( defined wantarray ) {
     return \%digest;
-  }
-  else {
+  } else {
     die "Trypsin() should be called in the list or scalar context";
   }
 }
@@ -909,28 +900,23 @@ sub Log {
     my $msg = join ": ", $type, ( join " ", @_ );
     say STDERR $msg;
     exit(1);
-  }
-  elsif ( $type eq 'Fatal' ) {
+  } elsif ( $type eq 'Fatal' ) {
     my $msg = join ": ", $type, ( join " ", @_ );
     croak $msg;
-  }
-  elsif ( $type eq 'Warn' ) {
+  } elsif ( $type eq 'Warn' ) {
     my $msg = join ": ", $type, ( join " ", @_ );
     say STDERR $msg;
-  }
-  elsif ( $type eq 'Info' ) {
+  } elsif ( $type eq 'Info' ) {
     if ($verbose) {
       my $msg = join ": ", $type, ( join " ", @_ );
       say STDERR $msg;
     }
-  }
-  elsif ( $type eq 'Debug' ) {
+  } elsif ( $type eq 'Debug' ) {
     if ($debug) {
       my $msg = join ": ", $type, ( join " ", @_ );
       say STDERR $msg;
     }
-  }
-  else {
+  } else {
     if ($verbose) {
       my $msg = join " ", $type, @_;
       say STDERR "Info: ", $msg;
