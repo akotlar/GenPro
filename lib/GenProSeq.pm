@@ -30,6 +30,8 @@ use Seq::DBManager;
 use Path::Tiny;
 use Scalar::Util qw/looks_like_number/;
 use DDP;
+use Test::More;
+
 extends 'Seq::Base';
 
 # We  add a few of our own annotation attributes
@@ -67,6 +69,9 @@ my %metaKeys = (
   },
   step2 => {
     refTxsWritten => 'refTxsWritten',
+  },
+  step3 => {
+    samplesWritten => 'finished',
   }
 );
 
@@ -149,7 +154,12 @@ sub annotate {
 
   say STDERR "FINISHED STEP 1 (make personal replacement db)";
 
-  ( $err, $sampleList, $wantedTxNums ) = $self->makeReferenceProtDb($wantedTxNums);
+  ( $err ) = $self->makeReferenceProtDb($wantedTxNums);
+
+  say STDERR "FINISHED STEP 2 (make reference protein db for requested txNumbers)";
+
+  # We may get rid of this step
+  ( $err ) = $self->createPersProtPermutations($sampleList, $wantedTxNums);
 
   say STDERR "FINISHED STEP 2 (make reference protein db for requested txNumbers)";
 
@@ -874,9 +884,7 @@ sub makeReferenceProtDb {
 
         push @codingSequence, $codonSequence;
         push @aaSequence, $aa;
-        # push @codonNums, $codonNumber;
-        # push @codonPos, $codonPosition;
-    # sleep(10);
+        
         # Thomas did this...figure out exactly why
         # But apparently on occassion there are multiple stop codons...
         # Why is this?
@@ -902,12 +910,11 @@ sub makeReferenceProtDb {
         p @codingSequence;
         die "WTF";
       }
-      # p $userSubstitutions;
-      # p$regionDb{$chr}{$nameFeatIdx}
-      # p $regionDb{$chr}[$txNumber]{$nameFeatIdx};
+      
+      # TODO: Move to testing package
       if($regionDb{$chr}[$txNumber]{$nameFeatIdx} eq 'NM_033467') {
-        # p $userSubstitutions->[0];
-        say STDERR join('', @aaSequence);
+        # https://www.ncbi.nlm.nih.gov/nuccore/NM_033467
+        ok(join('', @aaSequence eq 'MGKSEGPVGMVESAGRAGQKRPGFLEGGLLLLLLLVTAALVALGVLYADRRGKQLPRLASRLCFLQEERTFVKRKPRGIPEAQEVSEVCTTPGCVIAAARILQNMDPTTEPCDDFYQFACGGWLRRHVIPETNSRYSIFDVLRDELEVILKAVLENSTAKDRPAVEKARTLYRSCMNQSVIEKRGSQPLLDILEVVGGWPVAMDRWNETVGLEWELERQLALMNSQFNRRVLIDLFIWNDDQNSSRHIIYIDQPTLGMPSREYYFNGGSNRKVREAYLQFMVSVATLLREDANLPRDSCLVQEDMVQVLELETQLAKATVPQEERHDVIALYHRMGLEELQSQFGLKGFNWTLFIQTVLSSVKIKLLPDEEVVVYGIPYLQNLENIIDTYSARTIQNYLVWRLVLDRIGSLSQRFKDTRVNYRKALFGTMVEEVRWRECVGYVNSNMENAVGSLYVREAFPGDSKSMVRELIDKVRTVFVETLDELGWMDEESKKKAQEKAMSIREQIGHPDYILEEMNRRLDEEYSNLNFSEDLYFENSLQNLKVGAQRSLRKLREKVDPNLWIIGAAVVNAFYSPNRNQIVFPAGILQPPFFSKEQPQALNFGGIGMVIGHEITHGFDDNGRNFDKNGNMMDWWSNFSTQHFREQSECMIYQYGNYSWDLADEQNVNGFNTLGENIADNGGVRQAYKAYLKWMAEGGKDQQLPGLDLTHEQLFFINYAQVWCGSYRPEFAIQSIKTDVHSPLKYRVLGSLQNLAAFADTFHCARGTPMHPKERCRVW'));
       }
 
       $personalDb->dbPut($refProtEnv, $chr, $txNumber, [\@aaSequence, \@codingSequence]);
@@ -919,6 +926,219 @@ sub makeReferenceProtDb {
   MCE::Loop::finish();
 
   $personalDb->dbPut( $metaEnv, undef, $metaKeys{step2}{refTxsWritten}, \%writtenChrs );
+}
+
+sub createPersProtPermutations {
+  my $self           = shift;
+  my $sampleListHref = shift;
+  my $wantedTxNumHref = shift;
+
+  my $err;
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $db              = $self->{_db};
+  my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
+
+  my $completed = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{step3}{samplesWritten} );
+ 
+  my $found = 0;
+  for my $sample (keys %$sampleListHref) {
+    if(defined $completed->{$sample}) {
+      $found++;
+    }
+  }
+
+  if($found == %$sampleListHref) {
+    return;
+  }
+
+  # my $start = time();
+  my %refProtSeqData;
+  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
+    $refProtSeqData{$chr} //= {};
+    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
+      # push @txNums, [$chr, $txNum];
+      $refProtSeqData{$chr}{$txNum} =  $personalDb->dbReadOne($refProtEnv, $chr, $txNum);
+    }
+  }
+  
+  # say STDERR "PAST: " . (time() - $start) . " : num stuff: " . (keys %{$refProtSeqData{chr1}});
+  # sleep(5);
+  my %regionDb;
+  my %byTxRegion;
+
+  # These are always relative to the region database
+  # The computed features are totally separate
+  my $nameFeatIdx = $geneTrackGetter->getFieldDbName('name');
+  my $name2FeatIdx = $geneTrackGetter->getFieldDbName('name2');
+  my $strandFeatIdx = $geneTrackGetter->getFieldDbName('strand');
+  my $txErrorFeatIdx = $geneTrackGetter->getFieldDbName('txError');
+
+  my $exonStartsFeatIdx = $geneTrackGetter->getFieldDbName('exonStarts');
+  my $exonEndsFeatIdx = $geneTrackGetter->getFieldDbName('exonEnds');
+
+  my $cdsStartFeatIdx = $geneTrackGetter->getFieldDbName('cdsStart');
+  my $cdsEndFeatIdx = $geneTrackGetter->getFieldDbName('cdsEnd');
+
+
+  # TODO: store the order of these in meta table
+  # since that is effectively the feature index
+  # my @wanted = (
+  #   $exonicAlleleFuncIdx, $strandIdx, $codonNumIdx, $refCodonIdx, $altCodonIdx, $refAaIdx, $altAaIdx,
+  #   $nameIdx, $name2idx, $codonPosIdx
+  # );
+  my @wanted = (
+    'chr', 'pos', 'type', 'ref', 'alt',
+    'exonicAlleleFunction', 'strand', 'codonNum', 'refCodon', 'altCodon', 'refAa', 'altAa',
+    'name', 'name2', 'codonPos', 'txNumber', 'het'
+  );
+
+  my %wanted;
+  for (my $i = 0; $i < @wanted; $i++) {
+    $wanted{$wanted[$i]} = $i;
+  }
+
+  # These are never arrays
+  my $chrIdx = $wanted{'chr'};
+  my $posIdx = $wanted{'pos'};
+  my $typeIdx = $wanted{'type'};
+  my $refIdx = $wanted{'ref'};
+  my $altIdx = $wanted{'alt'};
+  my $hetIdx = $wanted{'het'};
+
+  # These can be arrays, if there are multiple transcripts
+  my $nameIdx = $wanted{'name'};
+  my $altAaIdx = $wanted{'altAa'};
+  my $altCodonIdx = $wanted{'altCodon'};
+  my $codonPosIdx = $wanted{'codonPos'};
+  my $codonNumIdx = $wanted{'codonNum'};
+  my $txNumberIdx = $wanted{'txNumber'};
+  my $strandIdx = $wanted{'strand'};
+
+  my $siteUnpacker = Seq::Tracks::Gene::Site->new();
+  my $siteTypeMap  = Seq::Tracks::Gene::Site::SiteTypeMap->new();
+  my $codonMap     = Seq::Tracks::Gene::Site::CodonMap->new();
+
+  my $strandSiteIdx        = $siteUnpacker->strandIdx;
+  my $siteTypeSiteIdx      = $siteUnpacker->siteTypeIdx;
+  my $codonSequenceSiteIdx = $siteUnpacker->codonSequenceIdx;
+  my $codonPositionSiteIdx = $siteUnpacker->codonPositionIdx;
+  my $codonNumberSiteIdx   = $siteUnpacker->codonNumberIdx;
+
+  my $geneTrackGetterDbName = $geneTrackGetter->dbName;
+
+  # Report every 1e4 lines, to avoid thrashing receiver
+  my %wantedTranscripts;
+  my %sampleData;
+  my $progressFunc = sub {
+    my ($chr, $sample, $userTxHref);
+
+    my @txNums = keys %$userTxHref;
+
+    $wantedTranscripts{$chr} //= {};
+
+
+    for my $txNum (@txNums) {
+      $wantedTranscripts{$chr}{$txNum} //= 1
+    }
+
+    $sampleData{$sample} //= {};
+    $sampleData{$sample} = $userTxHref;
+  };
+
+  MCE::Loop::init {
+    max_workers => $self->maxThreads || 8,
+
+    # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
+    # so accumulate less than we would if processing full .snp
+    chunk_size => 1,
+    gather     => $progressFunc,
+  };
+
+  mce_loop {
+    my ( $mce, $chunk_ref, $chunk_id ) = @_;
+
+    my $sample = $_;
+    # Each thread gets its own cursor
+    my  %cursors = ();
+
+    for my $chr ( @{ $self->chromosomes } ) {
+      my $dataAref = $personalDb->dbReadAll( $sample, $chr );
+
+      p $dataAref;
+
+      if(!defined $dataAref) {
+        next;
+      }
+
+      # Place all data into
+      # txName => [first modification, 2nd modification, etc]
+      # Where each modification = [chr, pos, name, codonNum, codonPos, altCodon, altAa]
+      my %userTx;
+
+      # Caveat: It seems that, per database ($chr), we can have only one
+      # read-only transaction; so ... yeah can't combine with dbRead, dbReadOne
+      if ( !$cursors{$chr} ) {
+        $cursors{$chr} = $db->dbStartCursorTxn($chr);
+      }
+
+      for my $data (@$dataAref) {
+        my $name = $data->[0][$nameIdx];
+        my $altAa = $data->[0][$altAaIdx];
+        my $altCodon = $data->[0][$altCodonIdx];
+        # my $codonPos = $data->[0][$codonPosIdx];
+        my $codonNum = $data->[0][$codonNumIdx];
+        # my $pos = $data->[0][$posIdx];
+
+        my $txNumber = $data->[0][$txNumberIdx];
+        my $strand = $data->[0][$strandIdx];
+
+        if(ref $name) {
+          # p $data;
+          for (my $i = 0; $i < @$name; $i++) {
+            $userTx{$txNumber->[$i]} //= [];
+
+            my @details = (
+              $txNumber->[$i], $name->[$i], $altCodon->[$i], $altAa->[$i], $strand->[$i]
+            );
+
+            push @{$userTx{$txNumber->[$i]}}, \@details;
+          }
+        } else {
+          $userTx{$txNumber} //= [];
+
+          # If any of the inner stuff is an array, it is guaranteed to 
+          # correspond to the $name
+          # for instance, if multiple spId's, they all belong to the 1 $name
+          my @details = (
+            $txNumber, $name, $altCodon, $altAa, $strand
+          );
+
+          push @{$userTx{$txNumber}}, \@details;
+        }
+      }
+
+      # TODO: it may be more efficient to build all transcripts at
+      # once, at cost of memory
+      # To not discard info / waste iterations when transcripts overlap
+      my @txNums = keys %userTx;
+      
+      for my $txNum (@txNums) {
+        my $refSeqData = $refProtSeqData{$chr}{$txNum};
+
+        p $refSeqData;
+        sleep(10);
+      }
+
+      # MCE->gather($sample, $chr, \%userTx);
+    }
+  }
+  sort { $a cmp $b } keys %$sampleListHref;
+
+  MCE::Loop::finish();
+
+  return ($err);
 }
 
 sub makeDbWriter {
@@ -937,8 +1157,6 @@ sub makeDbWriter {
       for my $txNum (keys %{$txNumbersHref->{$chr}}) {
         $txNumbersSeenHref->{$chr}{$txNum} //= 1;
       }
-      # p $txNum;
-
     }
   }
 }

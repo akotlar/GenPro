@@ -418,20 +418,21 @@ sub var_prot_for_tx {
     die "var_prot_for_tx() should be called in the list or scalar context";
   }
 }
-
-# DigestRefProt acts on the global refprots hash and digests  reference protein
-# and save the peptide fragments that are between min and max lengths (also
-# global variables)
-#  - note: will remove the '*' and any trailing sequence before making the digestion
-sub DigestRefProt {
-  for my $prot_id ( keys %refprots ) {
-    my $rec = $refprots{$prot_id};
-    my %d   = Trypsin( $rec->{prot_seq} );
-    for my $pep ( values %d ) {
-      $trpPepDb{$pep} = 1;
-    }
-  }
-}
+##################### Doesn't seem to be used at all... ########################
+## DigestRefProt acts on the global refprots hash and digests  reference protein
+## and save the peptide fragments that are between min and max lengths (also
+## global variables)
+##  - note: will remove the '*' and any trailing sequence before making the digestion
+## sub DigestRefProt {
+##   for my $prot_id ( keys %refprots ) {
+##     my $rec = $refprots{$prot_id};
+##     my %d   = Trypsin( $rec->{prot_seq} );
+##     for my $pep ( values %d ) {
+##       $trpPepDb{$pep} = 1;
+##     }
+##   }
+## }
+################################################################################
 
 sub add_seq_to_trp_db {
   my $seq = shift;
@@ -850,7 +851,8 @@ sub Trypsin {
     if ( BlockCutAa( $peptide[$end] ) ) {
 
       # any more cut sites?
-      if ( $i + 1 <= @cut_sites ) {
+      # I think this is a bug; $i + 1 must be less than @cut_sites here
+      if ( $i + 1 < @cut_sites ) {
         my $end = $cut_sites[ $i + 1 ];
         my $seq = join "", @peptide[ $start .. $end - 1 ];
         if ( length $seq >= $min_peptide_length && length $seq <= $max_peptide_length ) {
