@@ -157,6 +157,7 @@ sub MakeVarProt {
     $okChrsAref = \@chrs;
   }
 
+  # Iterate over all samples
   for my $id (@$idListAref) {
     # read data for each chromosome
     for my $chr (@$okChrsAref) {
@@ -312,6 +313,32 @@ sub var_prot_for_tx {
       # which substitutions should be made
       # hash keys are a string list of all sites with substitutions, with -9 meaning
       # reference
+
+      # NOTES from Thomas: Global peptides are those that are in the reference
+      # database, fully tryptic peptides
+      # trypsin cuts after arginine, or lysine, unless blocked by proline (if it's the next)
+      # in which case you get both fragments, the full length with the arginine followed by proline
+      # and the blocked peptide, ending in the arginine
+      # If you do a short digest you may cut at every arginine/lysine you could
+      # and those are also called "partially tryptic", but that's not what we're talking
+      # about here; that would be a miscleavage event
+      # it used to be that you used to do this overnight, but now a light digestion
+      # like 10 minutes, then you get, like whole genome sequencing a range of fragments
+      # We're focusing on addressing fully tryptic peptides
+
+      # That's what new_global_peptides does
+      # If there's a new unique peptide that is created, for a particular protein
+      # We should keep it
+      # If not, we shouldn't keep it.
+      # If it has a unique peptide the question is: we want to minimize the number
+      # of additions to the database
+      # Their could be 2 or more amino acid substitutions you could make,
+      # but only 1 unique peptide for those 2, so the choice would be 
+      # to keep the protein that has the fewest substituions that still results in
+      # a unique peptide
+      # Sometimes you may find 5 substitutions in the db, you want every permutation
+      # that's their, but only 2 of those amino acids leads to a unique peptides
+      # 
       for my $geno ( keys %seq_of_per_prot ) {
         my @sites = split / /, $geno;
         my @seq   = split //,  $seq_of_per_prot{$geno};
@@ -334,6 +361,9 @@ sub var_prot_for_tx {
         }
 
         # try to limit the number of permutations
+        # If new amino acid is not arginine or lysine, and the length of the peptide
+        # from the current position, to the position of the last 
+        # peptide we cut + 1,
         if ( !CutAa($new_aa)
           && $site - $last_site > $max_peptide_length )
         {

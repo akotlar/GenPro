@@ -63,29 +63,20 @@ has '+readOnly' => ( init_arg => undef, default => 1 );
 
 my $metaEnv = 'stats';
 my %metaKeys = (
-  step1 => {
-    samplesWritten => 'samplesWritten',
-    wantedTxs => 'wantedTxs',
-  },
-  step2 => {
-    refTxsWritten => 'refTxsWritten',
-  },
-  step3 => {
-    samplesWritten => 'finished',
-  }
+  samplesWritten => 'samplesWritten',
+  wantedTxs => 'wantedTxs',
+  refTxsWritten => 'refTxsWritten',
+  refPeptidesWritten => 'refPeptidesWritten',
+  samplePeptidesWritten => 'samplePeptidesWritten',
 );
 
 my $refProtEnv = 'referenceProteins';
-# my $metaSamplesWritten = 'samplesReplacementWritten';
-# my $metaWantedTxs
-# my %metaDbs = (
-#   'samplesCompleted' => ['completed, ''samplesWritten'],
-#   'txNumbers' => ['txNumbers', 'wantedTxNumbers'],
-# );
-# my %metaKeys = (
-#   'samplesCompleted' => 'samplesWritten',
-#   'txNumbers' => 'wantedTxNum'
-# );
+my $refPeptideEnv = 'referencePeptides';
+
+
+my $min_peptide_length = 6;
+my $max_peptide_length = 40;
+my $trim_end_regex     = qr{\*[\*\w]*\z};
 
 # TODO: further reduce complexity
 sub BUILD {
@@ -158,10 +149,12 @@ sub annotate {
 
   say STDERR "FINISHED STEP 2 (make reference protein db for requested txNumbers)";
 
-  # We may get rid of this step
-  ( $err ) = $self->createPersProtPermutations($sampleList, $wantedTxNums);
+  
+  ( $err ) = $self->makeReferenceUniquePeptides($sampleList, $wantedTxNums);
+  say STDERR "FINISHED STEP 3 (make reference peptide database for trypsin for requested txNumbers)";
 
-  say STDERR "FINISHED STEP 2 (make reference protein db for requested txNumbers)";
+  # We may get rid of this step
+  # ( $err ) = $self->createPersProtPermutations($sampleList, $wantedTxNums);
 
   # TODO: Inspect vcf header
 
@@ -213,8 +206,8 @@ sub makePersonalProtDb {
   my $toBuild = 0;
   my %completionMeta;
   # my $nSamples = @$sampleListAref;
-  my $c = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{step1}{samplesWritten} );
-  my $previousTxNums = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{step1}{wantedTxs} );
+  my $c = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{samplesWritten} );
+  my $previousTxNums = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{wantedTxs} );
 
   my %completed = $c ? %$c : ();
   my %wantedTxNumbers = $previousTxNums ? %$previousTxNums : ();
@@ -566,6 +559,9 @@ sub makePersonalProtDb {
         $txNumbers{$chr}{$num} //= 1;
       }
 
+      # my @wantedSamples = 
+
+      # Optimize, only read over hets + homs
       for my $sample (@$sampleListAref) {
         if ( $cnt == $max ) {
           # say STDERR "count is $cnt and max is $max: $line";
@@ -664,9 +660,9 @@ sub makePersonalProtDb {
 
   MCE::Loop::finish();
 
-  $personalDb->dbPut( $metaEnv, undef, $metaKeys{step1}{samplesWritten}, \%completed );
+  $personalDb->dbPut( $metaEnv, undef, $metaKeys{samplesWritten}, \%completed );
 
-  $personalDb->dbPut( $metaEnv, undef, $metaKeys{step1}{wantedTxs}, \%wantedTxNumbers );
+  $personalDb->dbPut( $metaEnv, undef, $metaKeys{wantedTxs}, \%wantedTxNumbers );
 
   $db->cleanUp();
 
@@ -692,8 +688,16 @@ sub makePersonalProtDb {
   return ( $err, \%completed, \%wantedTxNumbers );
 }
 
+# Generates everything that GenPro_make_refprotdb does
+# Also pre-calculates all digested peptides, and stores those
 sub makeReferenceProtDb {
   my ($self, $wantedTxNumHref) = @_;
+
+  my $personalDb = GenPro::DBManager->new();
+  $personalDb->_getDbi( $metaEnv, 'completed', 1 );
+
+  my $previouslyWritten = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{refTxsWritten} );
+  my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
 
   my @txNums;
   my %wantedChrs;
@@ -704,12 +708,6 @@ sub makeReferenceProtDb {
 
     $wantedChrs{$chr} //= 1;
   }
-
-  my $personalDb = GenPro::DBManager->new();
-  $personalDb->_getDbi( $metaEnv, undef, 1 );
-
-  my $previouslyWritten = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{step2}{refTxsWritten} );
-  my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
 
   # TODO: get the name string in some other way, maybe from YAML
   # or as an argument
@@ -822,12 +820,12 @@ sub makeReferenceProtDb {
       $db->dbReadCursorUnsafe($cursors{$chr}, \@data);
 
       my ( $fetchedTxNumbers, $siteData, $wantedSiteData );
-      my (@codingSequence, @aaSequence, @codonPos, @codonNums);
+      my (@codonSequence, @aaSequence, @codonPos, @codonNums);
 
       my $lastCodonNumber;
       for my $site (@data) {
         if(!defined) {
-          die 'WTF: no gene site';
+          die 'Err: no gene site';
         }
 
         ( $fetchedTxNumbers, $siteData ) = $siteUnpacker->unpack( $site->[ $geneTrackGetterDbName ] );
@@ -838,7 +836,7 @@ sub makeReferenceProtDb {
         # }
         if(!ref $fetchedTxNumbers) {
           if ($fetchedTxNumbers != $txNumber) {
-            die "WTF, expected all positions cdsStart ... cdsEnd - 1 to have an entry for tx $txNumber";
+            die "Err, expected all positions cdsStart ... cdsEnd - 1 to have an entry for tx $txNumber";
           }
 
           $wantedSiteData = $siteData;
@@ -855,7 +853,7 @@ sub makeReferenceProtDb {
           }
 
           if(!$found) {
-            die "WTF: Couldn't find txNumber $txNumber at Bystro site";
+            die "Err: Couldn't find txNumber $txNumber at Bystro site";
           }
 
           $wantedSiteData = $siteData->[$i];
@@ -882,7 +880,7 @@ sub makeReferenceProtDb {
 
         # my $codonPosition = $wantedSiteData->[$codonPositionSiteIdx];
 
-        push @codingSequence, $codonSequence;
+        push @codonSequence, $codonSequence;
         push @aaSequence, $aa;
         
         # Thomas did this...figure out exactly why
@@ -891,6 +889,8 @@ sub makeReferenceProtDb {
         # What import do they have?
         # Related to NMD
         # TODO: Write tests for such proteins
+        # TODO: Maybe report errors if this is not at the end of the transcript
+        # Convo w/ Thomas @ 11/13/18: Return the fragment, warn the user
         if($aa eq '*') {
           last;
         }
@@ -898,8 +898,8 @@ sub makeReferenceProtDb {
 
       if(!@aaSequence) {
         p $tx;
-        p @codingSequence;
-        die "WTF: couldn't make for tx $txNumber";
+        p @codonSequence;
+        die "Err: ouldn't make for tx $txNumber";
       }
 
       if(@aaSequence == 1) {
@@ -907,17 +907,17 @@ sub makeReferenceProtDb {
         # p $userSubstitutions;
         p $txNumber;
         p @aaSequence;
-        p @codingSequence;
-        die "WTF";
+        p @codonSequence;
+        die "Err";
       }
-      
+
       # TODO: Move to testing package
       if($regionDb{$chr}[$txNumber]{$nameFeatIdx} eq 'NM_033467') {
         # https://www.ncbi.nlm.nih.gov/nuccore/NM_033467
         ok(join('', @aaSequence eq 'MGKSEGPVGMVESAGRAGQKRPGFLEGGLLLLLLLVTAALVALGVLYADRRGKQLPRLASRLCFLQEERTFVKRKPRGIPEAQEVSEVCTTPGCVIAAARILQNMDPTTEPCDDFYQFACGGWLRRHVIPETNSRYSIFDVLRDELEVILKAVLENSTAKDRPAVEKARTLYRSCMNQSVIEKRGSQPLLDILEVVGGWPVAMDRWNETVGLEWELERQLALMNSQFNRRVLIDLFIWNDDQNSSRHIIYIDQPTLGMPSREYYFNGGSNRKVREAYLQFMVSVATLLREDANLPRDSCLVQEDMVQVLELETQLAKATVPQEERHDVIALYHRMGLEELQSQFGLKGFNWTLFIQTVLSSVKIKLLPDEEVVVYGIPYLQNLENIIDTYSARTIQNYLVWRLVLDRIGSLSQRFKDTRVNYRKALFGTMVEEVRWRECVGYVNSNMENAVGSLYVREAFPGDSKSMVRELIDKVRTVFVETLDELGWMDEESKKKAQEKAMSIREQIGHPDYILEEMNRRLDEEYSNLNFSEDLYFENSLQNLKVGAQRSLRKLREKVDPNLWIIGAAVVNAFYSPNRNQIVFPAGILQPPFFSKEQPQALNFGGIGMVIGHEITHGFDDNGRNFDKNGNMMDWWSNFSTQHFREQSECMIYQYGNYSWDLADEQNVNGFNTLGENIADNGGVRQAYKAYLKWMAEGGKDQQLPGLDLTHEQLFFINYAQVWCGSYRPEFAIQSIKTDVHSPLKYRVLGSLQNLAAFADTFHCARGTPMHPKERCRVW'));
       }
 
-      $personalDb->dbPut($refProtEnv, $chr, $txNumber, [\@aaSequence, \@codingSequence]);
+      $personalDb->dbPut($refPeptideEnv, $chr, $txNumber, [\@aaSequence, \@codonSequence]);
     }
 
     MCE->gather(\%seenChrs);
@@ -925,9 +925,117 @@ sub makeReferenceProtDb {
 
   MCE::Loop::finish();
 
-  $personalDb->dbPut( $metaEnv, undef, $metaKeys{step2}{refTxsWritten}, \%writtenChrs );
+  $personalDb->dbPut( $metaEnv, undef, $metaKeys{refTxsWritten}, \%writtenChrs );
+
+  $personalDb->cleanUp();
 }
 
+# Generates everything that GenPro_make_refprotdb does
+# Also pre-calculates all digested peptides, and stores those
+sub makeReferenceUniquePeptides {
+  my ($self, $wantedTxNumHref) = @_;
+p $wantedTxNumHref;
+  my $personalDb = GenPro::DBManager->new();
+  $personalDb->_getDbi( $refPeptideEnv, undef, 1 );
+
+  $personalDb->_getDbi( $metaEnv, undef, 1 );
+
+  my $previouslyWritten = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{refPeptidesWritten} );
+
+  my %writtenTxNums = $previouslyWritten ? %$previouslyWritten : ();
+p %writtenTxNums;
+  my @txNums;
+  my %wantedChrs;
+  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
+    if(!defined $writtenTxNums{$chr}) {
+      next;
+    }
+
+    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
+      if($writtenTxNums{$chr}{$txNum}) {
+        next;
+      }
+
+      push @txNums, [$chr, $txNum];
+      $wantedChrs{$chr} //= 1;
+    }
+  }
+
+  if(@txNums == 0) {
+    return;
+  }
+
+  my $progressFunc = sub {
+    my $seenChrs = shift;
+
+    for my $chr (keys %$seenChrs) {
+      for my $txNum (keys %{$seenChrs->{$chr}}) {
+        $writtenTxNums{$chr}{$txNum} = 1;
+      }
+    }
+  };
+
+  # my $siteUnpacker = Seq::Tracks::Gene::Site->new();
+  # my $siteTypeMap  = Seq::Tracks::Gene::Site::SiteTypeMap->new();
+  # my $codonMap     = Seq::Tracks::Gene::Site::CodonMap->new();
+
+  # my $strandSiteIdx        = $siteUnpacker->strandIdx;
+  # my $siteTypeSiteIdx      = $siteUnpacker->siteTypeIdx;
+  # my $codonSequenceSiteIdx = $siteUnpacker->codonSequenceIdx;
+  # my $codonPositionSiteIdx = $siteUnpacker->codonPositionIdx;
+  # my $codonNumberSiteIdx   = $siteUnpacker->codonNumberIdx;
+
+  # These are always relative to the region database
+  # my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
+  # The computed features are totally separate
+  # my $nameFeatIdx = $geneTrackGetter->getFieldDbName('name');
+  # my $name2FeatIdx = $geneTrackGetter->getFieldDbName('name2');
+  # my $strandFeatIdx = $geneTrackGetter->getFieldDbName('strand');
+  # my $txErrorFeatIdx = $geneTrackGetter->getFieldDbName('txError');
+
+  # my $exonStartsFeatIdx = $geneTrackGetter->getFieldDbName('exonStarts');
+  # my $exonEndsFeatIdx = $geneTrackGetter->getFieldDbName('exonEnds');
+
+  # my $cdsStartFeatIdx = $geneTrackGetter->getFieldDbName('cdsStart');
+  # my $cdsEndFeatIdx = $geneTrackGetter->getFieldDbName('cdsEnd');
+
+  MCE::Loop::init {
+    max_workers => $self->maxThreads || 8,
+
+    # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
+    # so accumulate less than we would if processing full .snp
+    chunk_size => 'auto',
+    gather     => $progressFunc,
+  };
+
+  mce_loop {
+    my ($mce, $chunk_ref, $chunk_id) = @_;
+
+    my %seenChrs;
+    for my $txNumInfo (@{ $chunk_ref }) {
+      my $chr = $txNumInfo->[0];
+      my $txNumber = $txNumInfo->[1];
+
+      $seenChrs{$chr} //= 1;
+
+      my $seqInfo = $personalDb->dbReadOne($refProtEnv, $chr, $txNumber);
+
+      p $seqInfo;
+
+    }
+
+    MCE->gather(\%seenChrs);
+  } @txNums;
+
+  MCE::Loop::finish();
+
+  # $personalDb->dbPut( $metaEnv, undef, $metaKeys{refTxsWritten}, \%writtenChrs );
+}
+
+# Replicates:
+# 1) sub var_prot_for_tx, which:
+## # var_prot_for_tx takes a variant record and returns an array of variant proteins;
+#### the caller may select the most parsimonious elements
 sub createPersProtPermutations {
   my $self           = shift;
   my $sampleListHref = shift;
@@ -940,7 +1048,7 @@ sub createPersProtPermutations {
   my $db              = $self->{_db};
   my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
 
-  my $completed = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{step3}{samplesWritten} );
+  my $completed = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{samplePeptidesWritten} );
  
   my $found = 0;
   for my $sample (keys %$sampleListHref) {
@@ -1063,6 +1171,7 @@ sub createPersProtPermutations {
     # Each thread gets its own cursor
     my  %cursors = ();
 
+    # TODO: optimize wanted chromosomes
     for my $chr ( @{ $self->chromosomes } ) {
       my $dataAref = $personalDb->dbReadAll( $sample, $chr );
 
@@ -1160,6 +1269,236 @@ sub makeDbWriter {
     }
   }
 }
+
+################ Borrowed from Thomas, with minor modifications ################
+# Choose informativ
+sub select_entries {
+  my $recs_aref = shift;
+
+  my @final_records;
+
+  my @s_records = sort_by_uniq_peptides(@$recs_aref);
+
+  while (@s_records) {
+    my $rec = shift @s_records;
+    push @final_records, $rec;
+
+    # add the tryptic peptides to the global db, which will be used when
+    # creating the next round of counts
+    add_seq_to_trp_db( $rec->{seq} );
+    @s_records = sort_by_uniq_peptides(@s_records);
+  }
+  return \@final_records;
+}
+
+sub sort_by_uniq_peptides {
+  my (@records) = @_;
+
+  my @s_records;
+  my @s_records_with_count = sort { $b->[0] <=> $a->[0] }
+  map { [ new_global_peptide( $_->{seq} ), $_ ] } @records;
+
+  # only want records if they contribute unique peptides
+  for ( my $i = 0 ; $i < @s_records_with_count ; $i++ ) {
+    if ( $s_records_with_count[$i]->[0] > 0 ) {
+      push @s_records, $s_records_with_count[$i]->[1];
+    }
+  }
+  return @s_records;
+}
+
+# Will not be used
+my %trp_peptides;
+my %trpPepDb;
+my @cut_sites;
+
+# new_global_peptide takes a string and returns a count of the number of globally
+# unique peptides the string possessesk
+sub new_global_peptide {
+  my $seq = shift;
+
+  my $existing_peptide_count = 0;
+
+  my %trp_peptides = Trypsin($seq);
+  if ( !%trp_peptides ) {
+    return $existing_peptide_count;
+  } else {
+    for my $pep ( values %trp_peptides ) {
+      if ( !exists $trpPepDb{$pep} ) {
+        $existing_peptide_count++;
+      }
+    }
+  }
+  return $existing_peptide_count;
+}
+
+# in-silico trypsin digestion
+
+# Trypsin takes a string and cuts it into peptides as fully tryptic peptides
+# while allowing for blockage by protline, results returned as either hash or
+# hash reference depending on calling context
+sub Trypsin {
+  # An array reference where each entry is an amino acid
+  my $aaAref = shift;
+
+  my %digest;
+
+  # Dont' check for "*", we'll just skip the "*" which should be last entry
+  # May be safe to just skip last entry, but let's check in case
+  # # always trim off anything after a '*'; the if ( index ...) > -1) is (probably)
+  # # speeding things up since most of the time there's no '*' and using the
+  # # regex is comparitively slow versus just checking whether the string exists
+  # if ( index( $peptide, '*' ) > -1 ) {
+  #   $peptide =~ s/$trim_end_regex//xm;
+  # }
+  
+  # replaced by $aaAref my @peptide = split( //, $peptide );
+  
+  my @peptides;
+  my $last_cut_site = 0;
+  
+  # The first base in the peptide we're building
+  my $nextStart = 0;
+
+  my $i = -1;
+  my @peptide;
+  for my $aa (@$aaAref) {
+    $i++;
+
+    if($aa eq '*') {
+      last;
+    }
+
+    push @peptide, $aa;
+
+    if($aa eq 'K' || $aa eq 'R') {
+      push @peptides, \@peptide;
+      @peptide = ();
+
+      $nextStart = $i + 1;
+    
+    }
+  }
+  for ( my $i = 0 ; $i < @$aaAref ; $i++ ) {
+    if ( $aaAref ) {
+      push @cut_sites, $i + 1;
+      $last_cut_site = $i + 1;
+    }
+  }
+
+  # if a K or R at the end, don't include it twice but also include the
+  # end of the protein
+  if ( $last_cut_site < @peptide ) {
+    push @cut_sites, scalar @peptide;
+  }
+
+  # reset
+  $last_cut_site = 0;
+
+  for ( my $i = 0 ; $i < @cut_sites ; $i++ ) {
+    my $start = $last_cut_site;
+    my $end   = $cut_sites[$i];
+    my $seq   = join "", @peptide[ $start .. $end - 1 ];
+
+    if ( length $seq >= $min_peptide_length && length $seq <= $max_peptide_length ) {
+      my $coord = sprintf( "%d:%d", $start + 1, $end );
+      $digest{$coord} = $seq;
+    }
+
+    if ( @peptide == $end ) {
+      last;
+    }
+
+    if ( BlockCutAa( $peptide[$end] ) ) {
+
+      # any more cut sites?
+      if ( $i + 1 <= @cut_sites ) {
+        my $end = $cut_sites[ $i + 1 ];
+        my $seq = join "", @peptide[ $start .. $end - 1 ];
+        if ( length $seq >= $min_peptide_length && length $seq <= $max_peptide_length ) {
+          my $coord = sprintf( "%d:%d", $start + 1, $end );
+          $digest{$coord} = $seq;
+        }
+      }
+    }
+    $last_cut_site = $end;
+  }
+  if (wantarray) {
+    return %digest;
+  } elsif ( defined wantarray ) {
+    return \%digest;
+  } else {
+    die "Trypsin() should be called in the list or scalar context";
+  }
+}
+
+sub CutAa {
+  my $aa = shift;
+
+  if ( $aa eq 'K' || $aa eq 'R' ) {
+    return 1;
+  }
+  return;
+}
+
+sub BlockCutAa {
+  my $aa = shift;
+
+  if ( $aa eq 'P' ) {
+    return 1;
+  }
+  return;
+}
+
+sub MakeVarProt {
+  my $path_db    = shift;
+  my $path_out   = shift;
+  my $idListAref = shift;
+  my $outDbName  = shift;
+  my $okChrsAref = shift;
+
+  my @records;
+
+  my $field_sep_char = ";";
+  my $rec_sep_char   = "|";
+
+  # defined acceptable chromosomes, which is really dependent on the binary db
+  if ( !defined $okChrsAref ) {
+    my @chrs = map { "chr$_" } ( 1 .. 22, 'X', 'Y', 'M' );
+    $okChrsAref = \@chrs;
+  }
+
+  for my $id (@$idListAref) {
+    # read data for each chromosome
+    for my $chr (@$okChrsAref) {
+      Log("Working on Chr: $chr");
+      my $per_rec_aref = ReadPerDb( $path_db, $id, $chr );
+      Log( "Read Tx from db: ", scalar @$per_rec_aref );
+
+      for my $per_rec_href (@$per_rec_aref) {
+        Log( "Working on", $per_rec_href->{name} );
+
+        # generate all permutations
+        my $var_prot_aref = var_prot_for_tx($per_rec_href);
+        #say dump( { before => $var_prot_aref } );
+
+        # select the most informative entries
+        $var_prot_aref = select_entries($var_prot_aref);
+        #say dump({ after => $var_prot_aref });
+        for my $r_href (@$var_prot_aref) {
+          my $final_href = create_per_prot_rec( $r_href, $per_rec_href, $field_sep_char );
+          push @records, $final_href;
+        }
+      }
+    }
+  }
+
+  Log("Started writing personal protein entries");
+  WritePerProt( $outDbName, $path_out, \@records, $rec_sep_char );
+  Log("Finished writing personal protein entries");
+}
+
+################################################################################
 
 sub _getFileHandles {
   my ( $self, $type ) = @_;
