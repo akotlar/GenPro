@@ -933,8 +933,8 @@ sub makeReferenceProtDb {
 # Generates everything that GenPro_make_refprotdb does
 # Also pre-calculates all digested peptides, and stores those
 sub makeReferenceUniquePeptides {
-  my ($self, $wantedTxNumHref) = @_;
-p $wantedTxNumHref;
+  my ($self, $wantedSamples, $wantedTxNumHref) = @_;
+# p $wantedTxNumHref;
   my $personalDb = GenPro::DBManager->new();
   $personalDb->_getDbi( $refPeptideEnv, undef, 1 );
 
@@ -943,11 +943,11 @@ p $wantedTxNumHref;
   my $previouslyWritten = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{refPeptidesWritten} );
 
   my %writtenTxNums = $previouslyWritten ? %$previouslyWritten : ();
-p %writtenTxNums;
+# p %writtenTxNums;
   my @txNums;
   my %wantedChrs;
   for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
-    if(!defined $writtenTxNums{$chr}) {
+    if(defined $writtenTxNums{$chr}) {
       next;
     }
 
@@ -960,7 +960,7 @@ p %writtenTxNums;
       $wantedChrs{$chr} //= 1;
     }
   }
-p @txNums;
+# p @txNums;
   if(@txNums == 0) {
     return;
   }
@@ -974,30 +974,6 @@ p @txNums;
       }
     }
   };
-
-  # my $siteUnpacker = Seq::Tracks::Gene::Site->new();
-  # my $siteTypeMap  = Seq::Tracks::Gene::Site::SiteTypeMap->new();
-  # my $codonMap     = Seq::Tracks::Gene::Site::CodonMap->new();
-
-  # my $strandSiteIdx        = $siteUnpacker->strandIdx;
-  # my $siteTypeSiteIdx      = $siteUnpacker->siteTypeIdx;
-  # my $codonSequenceSiteIdx = $siteUnpacker->codonSequenceIdx;
-  # my $codonPositionSiteIdx = $siteUnpacker->codonPositionIdx;
-  # my $codonNumberSiteIdx   = $siteUnpacker->codonNumberIdx;
-
-  # These are always relative to the region database
-  # my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
-  # The computed features are totally separate
-  # my $nameFeatIdx = $geneTrackGetter->getFieldDbName('name');
-  # my $name2FeatIdx = $geneTrackGetter->getFieldDbName('name2');
-  # my $strandFeatIdx = $geneTrackGetter->getFieldDbName('strand');
-  # my $txErrorFeatIdx = $geneTrackGetter->getFieldDbName('txError');
-
-  # my $exonStartsFeatIdx = $geneTrackGetter->getFieldDbName('exonStarts');
-  # my $exonEndsFeatIdx = $geneTrackGetter->getFieldDbName('exonEnds');
-
-  # my $cdsStartFeatIdx = $geneTrackGetter->getFieldDbName('cdsStart');
-  # my $cdsEndFeatIdx = $geneTrackGetter->getFieldDbName('cdsEnd');
 
   MCE::Loop::init {
     max_workers => $self->maxThreads || 8,
@@ -1020,7 +996,7 @@ p @txNums;
 
       my $seqInfo = $personalDb->dbReadOne($refProtEnv, $chr, $txNumber);
 
-      p $seqInfo;
+      # p $seqInfo;
 
     }
 
