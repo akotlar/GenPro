@@ -148,12 +148,12 @@ qsub -v USER -v PATH -cwd -t 1-26 runall_create_db.sh <genome>
 ```
 - Alternatively, iterate over all the chromosomes. For example:
 ```
-for ((i=1;i<27;i++)); do
-  GenPro_create_db.pl -g hg38 -c $i \
-    --genedir hg38/gene             \
-    --geneset knownGene             \
-    -f hg38/chr -o hg38/idx;
-done;
+ for ((i=1;i<27;i++)); do
+ GenPro_create_db.pl -g hg38 -c $i \
+ --genedir hg38/gene             \
+ --geneset refGene \
+ -f hg38/chr -o hg38/idx;
+ done;
 ```
 
 ### 3.  Make reference proteins for the organism.
