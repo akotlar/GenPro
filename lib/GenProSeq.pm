@@ -960,7 +960,7 @@ p %writtenTxNums;
       $wantedChrs{$chr} //= 1;
     }
   }
-
+p @txNums;
   if(@txNums == 0) {
     return;
   }
