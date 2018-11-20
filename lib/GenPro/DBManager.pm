@@ -18,7 +18,7 @@ our $VERSION = '0.001';
 
 use Mouse 2;
 with 'Seq::Role::Message';
-
+use Carp qw/croak/;
 # extends 'Seq::DBManager';
 
 use Data::MessagePack;
@@ -34,7 +34,7 @@ use Cwd;
 use Log::Fast;
 
 # Most common error is "MDB_NOTFOUND" which isn't nec. bad.
-$LMDB_File::die_on_err = 0;
+$LMDB_File::croak_on_err = 0;
 
 ######### Public Attributes
 # Flag for deleting tracks instead of inserting during patch* methods
@@ -42,6 +42,10 @@ has delete => ( is => 'rw', isa => 'Bool', default => 0, lazy => 1 );
 
 has dryRun => ( is => 'rw', isa => 'Bool', default => 0, lazy => 1 );
 
+has envs => (is => 'ro', isa => 'HashRef', init_arg => undef, default => sub {{}});
+
+# has cursors => (is => 'ro', isa => 'HashRef');
+# 
 # DBManager maintains its own, internal log, so that in a multi-user environment
 # DBA can keep track of key errors
 # TODO: Warning: cwd may fill up if left unchecked
@@ -52,8 +56,9 @@ my $internalLog = Log::Fast->new(
   }
 );
 
+
 # instanceConfig variable holding our databases; this way can be used
-# in environment where calling process never dies
+# in environment where calling process never croaks
 # {
 #   database_dir => {
 #     env => $somEnv, dbi => $someDbi
@@ -69,7 +74,7 @@ my %instanceConfig;
 
 # Each process should open each environment only once.
 # http://www.lmdb.tech/doc/starting.html
-my %envs;
+# my %envs;
 
 # We are enforcing a singel transaction per environment for the moment, especially
 # in light of the apparent LMDB_File restriction to this effect
@@ -81,15 +86,15 @@ my %cursors;
 sub initialize {
   my $data = @_ == 2 ? $_[1] : $_[0];
 
-  if (%instanceConfig) {
-    $internalLog->WARN("dbManager already initialized; clearing state");
+  if ($instance) {
+    $internalLog->WARN("dbManager already initialized, clearing singleton");
+    undef $instance;
+    return;
   }
-
-  cleanAndWipeSingleton();
 
   if ( !$data->{databaseDir} ) {
     $internalLog->ERR("dbManager requires a databaseDir");
-    die;
+    croak;
   }
 
   $instanceConfig{databaseDir} = path( $data->{databaseDir} );
@@ -115,7 +120,7 @@ around 'new' => sub {
 sub BUILD {
   my $self = shift;
 
-  # die 'HELLO';
+  # croak 'HELLO';
 
   # TODO: think about better way to initialize this class w.r.t databaseDir
   if ( !$instanceConfig{databaseDir} ) {
@@ -138,27 +143,25 @@ my $mp = Data::MessagePack->new()->prefer_integer()->prefer_float32();
 
 # Deprecated
 sub dbReadOne {
-
-  #my ($self, $envName, $dbName,$zeroPos, $skipCommit, $stringKeys,) = @_;
-  #== $_[0], $_[1],     $_[2]  ,$_[3]   , $_[4]      , $_[5] (don't assign to avoid copy)
+  #my ($self, $db,   $pos,  $skipCommit) = @_;
+  #== $_[0], $_[1], $_[2], $_[3]  # Don't assign to avoid copy
 
   #It is possible not to find a database in $dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
   #http://ideone.com/uzpdZ8
-  #                      #$name, $dontCreate, $stringKeys, $dbName
-  my $db = $_[0]->_getDbi( $_[1], 1, $_[5], $_[2] ) or return;
+  #                      #$name, $dontCreate, $stringKeys, $dbNamef
 
-  if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = $db->{env}->BeginTxn();
+  if ( !$_[1]->{db}->Alive ) {
+    $_[1]->{db}->Txn = $_[1]->{env}->BeginTxn();
 
     # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
-    $db->{db}->Txn->AutoCommit(1);
+    $_[1]->{db}->Txn->AutoCommit(1);
   }
 
-  $db->{db}->Txn->get( $db->{dbi}, $_[3], my $json );
+  $_[1]->{db}->Txn->get( $_[1]->{dbi}, $_[2], my $json );
 
   # Commit unless the user specifically asks not to
   #if(!$skipCommit) {
-  $db->{db}->Txn->commit() unless $_[4];
+  $_[1]->{db}->Txn->commit() unless $_[3];
 
   if ($LMDB_File::last_err) {
     if ( $LMDB_File::last_err != MDB_NOTFOUND ) {
@@ -179,7 +182,20 @@ sub dbReadOneRaw {
 
   $_[1]->get( $_[2], $_[3], my $json );
 
-  return defined $json ? $mp->unpack($json) : undef;
+  if ($LMDB_File::last_err) {
+    if ( $LMDB_File::last_err != MDB_NOTFOUND ) {
+      $_[0]->_errorWithCleanup("dbReadRaw LMDB error $LMDB_File::last_err");
+      return 255;
+    }
+
+    $LMDB_File::last_err = 0;
+  }
+
+  if(!defined $json) {
+    return undef;
+  }
+
+  return $mp->unpack($json);
 }
 
 # Simplified dbRead: Takes a transaction from an already-opened database
@@ -250,6 +266,8 @@ sub getTxn {
 sub dbPatchHash {
   my ( $self, $chr, $pos, $dataHref, $mergeFunc, $skipCommit, $overwrite, $stringKeys ) =
   @_;
+
+  die "NOT IMPLEMENTED YET";
 
   if ( ref $dataHref ne 'HASH' ) {
     $self->_errorWithCleanup("dbPatchHash requires a 1-element hash of a hash");
@@ -363,19 +381,10 @@ sub dbPatchHash {
 # Write transactions are by default committed
 # Removed delete, overwrite capacities
 sub dbPatch {
+  my ( $self, $db,       $trackIndex, $pos,  $trackValue, $mergeFunc, $skipCommit) = @_;
+  #.   $_[0], $_[1]    , $_[2]  ,     $_[3], $_[4],       $_[5]      , $_[6] 
 
-  #my ($self, $envName , $dbName, $trackIndex, $pos, $trackValue, $mergeFunc, $skipCommit, $stringKeys) = @_;
-  #.   $_[0], $_[1]    , $_[2]  , $_[3]      , $_[4],$_[5]      , $_[6]     , $_[7]      , $_[8]
-
-  # 0 argument means "create if not found"
-  #my $db = $self->_getDbi($chr, 0, $stringKeys);
-  my $db = $_[0]->_getDbi( $_[1], 0, $_[8], $_[2] ) or return 255;
-
-  if ( !$db || !$db->{db} || !$db->{env} ) {
-    $_[0]->_errorWithCleanup( "Couldn't open $_[1] database. readOnly is "
-      . ( $instanceConfig{readOnly} ? "set" : "not set" ) );
-    return 255;
-  }
+  die "NOT IMPLEMENTED YET";
 
   if ( !$db->{db}->Alive ) {
     $db->{db}->Txn = $db->{env}->BeginTxn();
@@ -388,7 +397,7 @@ sub dbPatch {
 
   #zero-copy
   #$db->{db}->Txn->get($db->{dbi}, $pos, my $json);
-  $txn->get( $db->{dbi}, $_[4], my $json );
+  $txn->get( $db->{dbi}, $_[3], my $json );
 
   if ($LMDB_File::last_err) {
     if ( $LMDB_File::last_err != MDB_NOTFOUND ) {
@@ -477,41 +486,23 @@ sub dbPatch {
 
 # Write transactions are by default committed
 sub dbPut {
-  my ( $self, $env, $dbName, $pos, $data, $skipCommit, $stringKeys ) = @_;
+  #my ( $self, $db, $pos, $data, $skipCommit ) = @_;
+  #           $_[1],$_[2],$_[3], $_[4]
 
-  if ( $self->dryRun ) {
-    $self->log( 'info', "DBManager dry run: would have dbPut $env:$pos" );
-    return 0;
-  }
-
-  if ( !( defined $env && defined $pos ) ) {
-    $self->_errorWithCleanup("dbPut requires position");
-    return 255;
-  }
-
-  # 0 to create database if not found
-  my $db = $self->_getDbi( $env, 0, $stringKeys, $dbName );
-
-  if ( !$db ) {
-    $self->_errorWithCleanup( "Couldn't open $env database. readOnly is "
-      . ( $instanceConfig{readOnly} ? "set" : "not set" ) );
-    return 255;
-  }
-
-  if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = $db->{env}->BeginTxn();
+  if ( !$_[1]->{db}->Alive ) {
+    $_[1]->{db}->Txn = $_[1]->{env}->BeginTxn();
 
     # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
-    $db->{db}->Txn->AutoCommit(1);
+    $_[1]->{db}->Txn->AutoCommit(1);
   }
 
-  $db->{db}->Txn->put( $db->{dbi}, $pos, $mp->pack($data) );
+  $_[1]->{db}->Txn->put( $_[1]->{dbi}, $_[2], $mp->pack($_[3]) );
 
-  $db->{db}->Txn->commit() unless $skipCommit;
+  $_[1]->{db}->Txn->commit() unless $_[4];
 
   if ($LMDB_File::last_err) {
     if ( $LMDB_File::last_err != MDB_KEYEXIST ) {
-      $self->_errorWithCleanup("dbPut LMDB error: $LMDB_File::last_err");
+      $_[0]->_errorWithCleanup("dbPut LMDB error: $LMDB_File::last_err");
       return 255;
     }
 
@@ -521,6 +512,25 @@ sub dbPut {
 
   return 0;
 }
+
+sub dbPutRaw {
+  #my ( $self, $txn,  $dbi,  $key,  $value     = @_;
+      # $_[0]  $_[1], $_[2], $_[3], $_[4]
+  $_[1]->put( $_[2], $_[3], $mp->pack($_[4]) );
+   
+  if ($LMDB_File::last_err) {
+    if ( $LMDB_File::last_err != MDB_KEYEXIST && $LMDB_File::last_err != MDB_NOTFOUND ) {
+      $_[0]->_errorWithCleanup("dbPut LMDB error: $LMDB_File::last_err");
+      return 255;
+    }
+
+    #reset the class error variable, to avoid crazy error reporting later
+    $LMDB_File::last_err = 0;
+  }
+
+  return 0;
+}
+
 
 sub dbDelete {
   my ( $self, $chr, $pos, $stringKeys ) = @_;
@@ -572,6 +582,7 @@ sub dbDelete {
 sub dbReadAll {
   my ( $self, $envName, $dbName, $skipCommit, $stringKeys ) = @_;
 
+  die "NOT IMPLEMENTED YET";
   #==   $_[0], $_[1], $_[2]
 
   #It is possible not to find a database in dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
@@ -855,7 +866,6 @@ sub dbPatchCursorUnsafe {
   #    $_[0]. $_[1].   $_[2]. $_[3].  $_[4] $_[5].     $_[6]
 
   #$cursor->[1]->_get($pos, my $json, MDB_SET);
-  p $_[1];
   $_[1]->[1]->_get( $_[4], my $json, MDB_SET );
 
   my $existingValue = defined $json ? $mp->unpack($json) : [];
@@ -1016,6 +1026,7 @@ state $metaDbNamePart = '_meta';
 sub dbReadMeta {
   my ( $self, $databaseName, $metaKey, $skipCommit ) = @_;
 
+  die "NOT IMPLEMENTED YET";
   # pass 1 to use string keys for meta properties
   return $self->dbReadOne( $databaseName . $metaDbNamePart, $metaKey, $skipCommit, 1 );
 }
@@ -1027,6 +1038,7 @@ sub dbReadMeta {
 sub dbPatchMeta {
   my ( $self, $databaseName, $metaKey, $data ) = @_;
 
+  die "NOT IMPLEMENTED YET";
   # my $dbName = $databaseName . $metaDbNamePart;
 
   # If the user treats this metaKey as a scalar value, overwrite whatever was there
@@ -1079,14 +1091,16 @@ sub dbDropDatabase {
 
 # We should really make this public and the return object from this
 # to be required in any methods
+# TODO: pass configuration hash, rather than N arguments
+# TODO: allow opening of readOnly databases, not just environments?
 sub _getDbi {
 
   # Exists and not defined, because in read only database we may discovercea
   # that some chromosomes don't have any data (example: hg38 refSeq chrM)
-  # my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs ) = @_;
-  #       $_[0]  $_[1], $_[2],      $_[3],        $_[4],   $_[5]
-  if ( $envs{ $_[1] } && $envs{ $_[1] }{dbs}{ $_[4] || 0 } ) {
-    return $envs{ $_[1] }{dbs}{ $_[4] || 0 };
+  # my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs, $readOnly ) = @_;
+  #       $_[0]  $_[1], $_[2],      $_[3],        $_[4],   $_[5],   $_[6]
+  if ( $_[0]->envs->{ $_[1] } && $_[0]->envs->{ $_[1] }{dbs}{ $_[4] || 0 } ) {
+    return $_[0]->envs->{ $_[1] }{dbs}{ $_[4] || 0 };
   }
 
   # say STDERR "Couldn't find $_[1]:$_[4]";
@@ -1098,17 +1112,17 @@ sub _getDbi {
   if ( $instanceConfig{readOnly} ) {
     #MDB_RDONLY can also be set per-transcation; it's just not mentioned
     #in the docs
-    $flags = MDB_NOTLS | MDB_NOLOCK | MDB_NOSYNC | MDB_RDONLY | MDB_NORDAHEAD;
+    $flags = MDB_NOTLS | MDB_NOLOCK | MDB_RDONLY | MDB_NORDAHEAD;
   } else {
     # We read synchronously during building, which is our only mixed workload
     # Without NOTLS LMDB will deadlock, at least on Mac OSX, when spawning
     # more than 501 databases each with 25 sub-databases
     # some related info here
     # https://github.com/bmatsuo/lmdb-go/issues/94
-    $flags = MDB_NOSYNC | MDB_NOTLS;
+    $flags = MDB_NOTLS;
   }
 
-  if ( !$envs{$name}{env} ) {
+  if ( !$self->envs->{$name}{env} ) {
     $maxDbs //= 0;
 
     # Maximum db size
@@ -1123,14 +1137,14 @@ sub _getDbi {
       # If dbReadOnly flag set, this database will NEVER be created during the
       # current execution cycle
       if ( $instanceConfig{readOnly} ) {
-        return;
+        $self->_errorWithCleanup("Called _getDbi, but readOnly set and database folder doesn't exist");
       }
 
       if ($dontCreate) {
 
         # dontCreate does not imply the database will never be created,
         # so we don't want to update $self->_envs
-        return;
+        $self->_errorWithCleanup("Called _getDbi, but $dontCreate passed and database folder doesn't exist");
       }
 
       $dbPath->mkpath;
@@ -1144,7 +1158,7 @@ sub _getDbi {
         mapsize    => $mapSize,
         mode       => 0600,
         flags      => $flags,
-        maxdbs     => $maxDbs + 1,
+        maxdbs     => $maxDbs > 0 ? $maxDbs + 1 : $maxDbs,
         maxreaders => 32,
       }
     );
@@ -1154,13 +1168,12 @@ sub _getDbi {
         "Failed to create environment $name:$namedDb for $instanceConfig{databaseDir}
         beacuse of $LMDB_File::last_err"
       );
-      return;
     }
 
-    $envs{$name}{env} = $env;
+    $self->envs->{$name}{env} = $env;
   }
 
-  my $env = $envs{$name}{env};
+  my $env = $self->envs->{$name}{env};
 
   my $txn = $env->BeginTxn();
 
@@ -1169,7 +1182,6 @@ sub _getDbi {
       "Failed to associate transaction with environment $name:$namedDb
       beacuse of $LMDB_File::last_err"
     );
-    return;
   }
 
   my $dbFlags = 0;
@@ -1177,6 +1189,7 @@ sub _getDbi {
   # Much faster random, somewhat faster sequential performance
   # Much smaller database size (4 byte keys, vs 6-10 byte keys)
   if ( !$stringKeys ) {
+    # say STDERR "Opening $name, $namedDb as integer keys";
     $dbFlags = MDB_INTEGERKEY;
   }
 
@@ -1185,13 +1198,12 @@ sub _getDbi {
   }
 
   my $DB = $txn->OpenDB( $namedDb, $dbFlags );
-
+  
   if ($LMDB_File::last_err) {
     $self->_errorWithCleanup(
       "Failed to open database $name:$namedDb for
       $instanceConfig{databaseDir} beacuse of $LMDB_File::last_err"
     );
-    return;
   }
 
   # ReadMode 1 gives memory pointer for perf reasons, not safe
@@ -1200,22 +1212,29 @@ sub _getDbi {
   # Now db is open
   my $err = $txn->commit();
 
+  # This DOES NOT fully prevent EINVAL when MDB_NOSYNC is used in conjunction with NO_TLS
+  # and when we're opening very many databases
+  # $env->sync(1);
+
   if ($err) {
     $self->_errorWithCleanup("Failed to commit open db tx because: $err");
-    return;
   }
 
+  # To prevents EINVAL when MDB_NOSYNC is used in conjunction with NO_TLS
+  # our database should be opened with sync enabled.
+  $env->set_flags(MDB_NOSYNC, 1);
+
   $namedDb //= 0;
-  $envs{$name}{dbs}{$namedDb} = {
+  $self->envs->{$name}{dbs}{$namedDb} = {
     dbi    => $DB->dbi,
     db     => $DB,
     tflags => $flags,
-    env    => $envs{$name}{env},
+    env    => $env,
   };
 
-  $envs{$name}{txn} = 0;
+  # $envs{$name}{txn} = 0;
 
-  return $envs{$name}{dbs}{$namedDb};
+  return $self->envs->{$name}{dbs}{$namedDb};
 }
 
 # TODO: test with Txn->env->sync instead of {env}->sync
@@ -1224,7 +1243,7 @@ sub dbForceCommit {
 
   my $db = $self->_getDbi( $envName, undef, undef, $dbName );
 
-  if ( !defined $envs{$envName} ) {
+  if ( !defined $self->envs->{$envName} ) {
     $self->_errorWithCleanup('dbManager expects existing environment in dbForceCommit');
   }
 
@@ -1245,99 +1264,114 @@ sub dbForceCommit {
 # @param <Seq::DBManager> $self (optional)
 # @param <String> $envName (optional) : the name of a specific environment
 sub cleanUp {
-  my $msg = @_ == 2 ? $_[1] : $_[0];
+  my ($self, $msg) = @_;
 
   if ($msg) {
     $internalLog->ERR($msg);
   }
 
-  $LMDB_File::last_err = 0;
-
-  if ( !%envs && !%cursors ) {
-    return 0;
-  }
-
-  if ( !%envs && %cursors ) {
-    _fatalError('dbManager expects no cursors if no environments opened');
+  if ( $LMDB_File::last_err
+    && $LMDB_File::last_err != MDB_NOTFOUND
+    && $LMDB_File::last_err != MDB_KEYEXIST )
+  {
+    _fatalError("dbCleanUp LMDB error: $LMDB_File::last_err");
 
     return 255;
   }
 
-  # We track the unsafe stuff, just as a precaution
-  foreach ( keys %cursors ) {
+  undef $instance;
+  return;
 
-    # Check defined because database may be empty (and will be stored as undef)
-    if ( defined $cursors{$_} ) {
+  # The below seems to cause issues; get 22 EINVAL
+  # when opening thousands of parallel databases and calling this
+  # $LMDB_File::last_err = 0;
 
-      for my $cursor ( values %{ $cursors{$_}{cursors} } ) {
-        $cursor->[1]->close();
-      }
+  # if ( !%{$self->envs} && !%cursors ) {
+  #   return 0;
+  # }
 
-      $cursors{$_}{txn}->commit();
+  # if ( !%{$self->envs} && %cursors ) {
+  #   _fatalError('dbManager expects no cursors if no environments opened');
 
-      delete $cursors{$_};
+  #   return 255;
+  # }
 
-      if ( $LMDB_File::last_err
-        && $LMDB_File::last_err != MDB_NOTFOUND
-        && $LMDB_File::last_err != MDB_KEYEXIST )
-      {
-        _fatalError("dbCleanUp LMDB error: $LMDB_File::last_err");
+  # foreach ( keys %{$self->envs} ) {
+  #   $self->envs->{$_}{env}->set_flags(MDB_NOSYNC, 0);
+  # }
 
-        return 255;
-      }
-    }
-  }
+  # # We track the unsafe stuff, just as a precaution
+  # foreach ( keys %cursors ) {
 
-  # May not be necessary, but easier to read, protect against references
-  # not being properly deleted
-  undef %cursors;
+  #   # Check defined because database may be empty (and will be stored as undef)
+  #   if ( defined $cursors{$_} ) {
 
-  foreach ( keys %envs ) {
-    foreach my $db ( values %{ $envs{$_}{dbs} } ) {
+  #     for my $cursor ( values %{ $cursors{$_}{cursors} } ) {
+  #       $cursor->[1]->close();
+  #     }
 
-      # Check defined because database may be empty (and will be stored as undef)
-      if ( defined $db->{db} && $db->{db}->Alive ) {
-        $db->{db}->Txn->commit();
+  #     $cursors{$_}{txn}->commit();
 
-        if ( $LMDB_File::last_err
-          && $LMDB_File::last_err != MDB_NOTFOUND
-          && $LMDB_File::last_err != MDB_KEYEXIST )
-        {
-          _fatalError("dbCleanUp LMDB error during db cleanup: $LMDB_File::last_err");
+  #     delete $cursors{$_};
 
-          return 255;
-        }
-      }
-    }
+  #     if ( $LMDB_File::last_err
+  #       && $LMDB_File::last_err != MDB_NOTFOUND
+  #       && $LMDB_File::last_err != MDB_KEYEXIST )
+  #     {
+  #       _fatalError("dbCleanUp LMDB error: $LMDB_File::last_err");
 
-    delete $envs{$_}{dbs};
+  #       return 255;
+  #     }
+  #   }
+  # }
 
-    if ( defined $envs{$_}{env} ) {
+  # # May not be necessary, but easier to read, protect against references
+  # # not being properly deleted
+  # undef %cursors;
 
-      # Sync in case MDB_NOSYNC, MDB_MAPASYNC, or MDB_NOMETASYNC were enabled
-      # sync(1) flag needed to ensure that disk buffer is flushed with MDB_NOSYNC, MAPASYNC
-      $envs{$_}{env}->sync(1);
-      $envs{$_}{env}->Clean();
-    }
+  # foreach ( keys %{$self->envs} ) {
+  #   foreach my $db ( values %{ $self->envs->{$_}{dbs} } ) {
+  #     # Check defined because database may be empty (and will be stored as undef)
+  #     if ( defined $db->{db} && $db->{db}->Alive ) {
+  #       $db->{db}->Txn->commit();
 
-    delete $envs{$_};
+  #       if ( $LMDB_File::last_err
+  #         && $LMDB_File::last_err != MDB_NOTFOUND
+  #         && $LMDB_File::last_err != MDB_KEYEXIST )
+  #       {
+  #         _fatalError("dbCleanUp LMDB error during db cleanup: $LMDB_File::last_err");
 
-    if ($LMDB_File::last_err) {
-      _fatalError("dbCleanUp LMDB error during env cleanup: $LMDB_File::last_err");
+  #         return 255;
+  #       }
+  #     }
+  #   }
 
-      return 255;
-    }
-  }
+  #   if ( defined $self->envs->{$_}{env} ) {
 
-  # May not be necessary, but easier to read, protect against references
-  # not being properly deleted
-  undef %envs;
+  #     # Sync in case MDB_NOSYNC, MDB_MAPASYNC, or MDB_NOMETASYNC were enabled
+  #     # sync(1) flag needed to ensure that disk buffer is flushed with MDB_NOSYNC, MAPASYNC
+  #     # $self->envs->{$_}{env}->sync(1);
+  #     $self->envs->{$_}{env}->Clean();
+  #   }
 
-  return 0;
+  #   delete $self->envs->{$_};
+
+  #   if ($LMDB_File::last_err) {
+  #     _fatalError("dbCleanUp LMDB error during env cleanup: $LMDB_File::last_err");
+
+  #     return 255;
+  #   }
+  # }
+
+  # undef $instance;
+
+  # return 0;
 }
 
 sub cleanAndWipeSingleton {
-  cleanUp();
+  my $self = shift;
+  
+  $self->cleanUp();
 
   undef $instance;
   undef %instanceConfig;
@@ -1346,7 +1380,9 @@ sub cleanAndWipeSingleton {
 # Like DESTROY, but Moosier
 sub DEMOLISH {
   my $self = shift;
-  $self->cleanUp();
+  # $self->cleanUp();
+
+  # say STDERR "DESTROY RAN";
 
   return;
 }
@@ -1354,9 +1390,9 @@ sub DEMOLISH {
 # For now, we'll throw the error, until program is changed to expect error/success
 # status from functions
 sub _errorWithCleanup {
-  my $msg = @_ == 2 ? $_[1] : $_[0];
+  my ($self, $msg) = @_;
 
-  cleanUp($msg);
+  $self->cleanUp($msg);
 
   _fatalError($msg);
 
@@ -1372,7 +1408,7 @@ sub _fatalError {
   $LMDB_File::last_err = 0;
 
   __PACKAGE__->log( 'fatal', $msg );
-  die $msg;
+  croak $msg;
 }
 
 1;

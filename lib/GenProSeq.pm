@@ -1,3 +1,6 @@
+# TODO: Put each database in a separate environemnet, aka folder
+# or at least put the meta information as a subfolder, say refProteins/meta
+
 use 5.10.0;
 use strict;
 use warnings;
@@ -6,9 +9,6 @@ package GenProSeq;
 
 our $VERSION = '0.001';
 
-# ABSTRACT: Annotate a snp file
-
-# TODO: make temp_dir handling more transparent
 use Mouse 2;
 use Types::Path::Tiny qw/AbsFile/;
 
@@ -31,6 +31,9 @@ use Path::Tiny;
 use Scalar::Util qw/looks_like_number/;
 use DDP;
 use Test::More;
+
+use LMDB_File qw(:all);
+$LMDB_File::die_on_err = 0;
 
 extends 'Seq::Base';
 
@@ -74,9 +77,15 @@ my $refProtEnv = 'referenceProteins';
 my $refPeptideEnv = 'referencePeptides';
 
 
-my $min_peptide_length = 6;
-my $max_peptide_length = 40;
+my $minPeptideLength = 6;
+my $maxPeptideLength = 40;
 my $trim_end_regex     = qr{\*[\*\w]*\z};
+
+my %digestFuncs = (
+  'trypsin' => \&trypsin,
+);
+
+# my $mp = Data::MessagePack->new()->prefer_integer()->prefer_float32();
 
 # TODO: further reduce complexity
 sub BUILD {
@@ -172,7 +181,6 @@ sub makePersonalProtDb {
   my $self = shift;
   my $type = shift;
 
-
   # This replicates sub ProcessIds {
   # which just returns an array of ids
   my ( $err, $fh, $outFh, $statsFh, $sampleListAref ) =
@@ -191,24 +199,19 @@ sub makePersonalProtDb {
     return ( $err, undef );
   }
 
-  my $db = $self->{_db};
-
   my $personalDb = GenPro::DBManager->new();
 
-  $personalDb->_getDbi( $metaEnv, undef, 1);
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, 1);
+    my $c = $personalDb->dbReadOne( $metaDb, $metaKeys{samplesWritten} );
+    my $previousTxNums = $personalDb->dbReadOne( $metaDb, $metaKeys{wantedTxs} );
 
-  my %okToBuild;
-  my %seen;
+  # Need to clean up after ourselves
+  # Otherwise we'll have a dangling reference to a free'd environment in LMDB
+  undef $metaDb;
+
   # Create the databases, 1 database per sample,
   # and each sample database was 25 tables, 1 per chromosome
-  my $nChr = @{ $self->chromosomes };
-
-  my $toBuild = 0;
-  my %completionMeta;
-  # my $nSamples = @$sampleListAref;
-  my $c = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{samplesWritten} );
-  my $previousTxNums = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{wantedTxs} );
-
+  
   my %completed = $c ? %$c : ();
   my %wantedTxNumbers = $previousTxNums ? %$previousTxNums : ();
 
@@ -216,15 +219,24 @@ sub makePersonalProtDb {
     return ( undef, \%completed, \%wantedTxNumbers);
   }
 
-  for my $sample (@$sampleListAref) {
-    if ( $completed{$sample} ) {
-      next;
-    }
+  # # Ensure that the database is opened
+  my $nChr = @{ $self->chromosomes };
 
-    for my $chr ( @{ $self->chromosomes } ) {
-      $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
-    }
-  }
+  # It *SEEMS* I don't have to pre-make the databases....
+  # TODO: Write test for this...
+  # for my $sample (@$sampleListAref) {
+  #   if ( $completed{$sample} ) {
+  #     next;
+  #   }
+
+  #   for my $chr ( @{ $self->chromosomes } ) {
+  #     $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
+  #   }
+  # }
+  
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+  undef $personalDb;
 
   ######################## Build the fork pool #################################
 
@@ -322,6 +334,8 @@ sub makePersonalProtDb {
     $nameIdx, $name2Idx, $codonPosIdx, $txNumberIdx
   );
 
+  my $db = $self->{_db};
+
   mce_loop_f {
 
     my ( $mce, $slurp_ref, $chunk_id ) = @_;
@@ -347,14 +361,12 @@ sub makePersonalProtDb {
     my %pCursors = ();
 
     my %txNumbers;
-    # GenPro::DBManager::initialize(
-    #   {
-    #     databaseDir => path( $self->database_dir )->parent()->child("genpro")->stringify()
-    #   }
-    # );
+    my %dbs;
 
-    # my $personalDb = GenPro::DBManager->new();
-
+    # since we cleared db singleton using cleanUp, we now have a new instance
+    # local to this thread
+    $personalDb  =  GenPro::DBManager->new();
+   
     ####### Read #######
     # The ouptut of the intermediate fileProcessor is expected to be
     # chrom \t pos \t type \t inputRef \t alt \t hets \t heterozygosity \t homs ...
@@ -593,63 +605,25 @@ sub makePersonalProtDb {
         # sample index
         # TODO: Use cursor; don't add unnecessary track key, add merge function
         # in case of multiallelics
-        $personalDb->dbPatch( $sample, $chr, 0, $zeroPos, \@record );
+        if(!$dbs{$sample}) {
+          $dbs{$sample} = {
+            $chr => $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr )
+          };
+        } elsif(!$dbs{$sample}{$chr}) {
+          $dbs{$sample}{$chr} = $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
+        }
 
-        # my $name = $record[$nameIdx];
-        # my $altAa = $record[$altAaIdx];
-        # my $altCodon = $record[$altCodonIdx];
-        # my $codonPos = $record[$codonPosIdx];
-        # my $codonNum = $record[$codonNumIdx];
-        # my $pos = $zeroPos;
-
-        # my $txNumber = $record[$txNumberIdx];
-        # my $strand = $record[$strandIdx];
-
-        # if(ref $name) {
-        #   # p $data;
-        #   for (my $i = 0; $i < @$name; $i++) {
-        #     $userTx{$txNumber->[$i]} //= [];
-
-        #     my @details = (
-        #       $chr, $pos, $txNumber->[$i], $name->[$i], $codonNum->[$i],
-        #       $codonPos->[$i], $altCodon->[$i], $altAa->[$i], $strand->[$i]
-        #     );
-
-        #     push @{$userTx{$txNumber->[$i]}}, \@details;
-        #   }
-        # } else {
-        #   $userTx{$txNumber} //= [];
-
-        #   # If any of the inner stuff is an array, it is guaranteed to
-        #   # correspond to the $name
-        #   # for instance, if multiple spId's, they all belong to the 1 $name
-        #   my @details = (
-        #     $chr, $pos, $txNumber, $name, $codonNum, $codonPos,
-        #     $altCodon, $altAa, $strand
-        #   );
-
-        #   push @{$userTx{$txNumber}}, \@details;
-        # }
-
-        # # push @txNumbers, $record[$txNumberIdx];
-        # push @{$userTx{$txNumber->[$i]}}, \@details;
-        # Uncomment to test
-        # my $val = $personalDb->dbReadOne( $sample, $chr, $zeroPos );
+        # We don't currently support multiallelics
+        $personalDb->dbPut( $dbs{$sample}{$chr}, $zeroPos, \@record );
       }
-
-      # If it becomes unsafe to use NOTLS and write from multiple processes
-      # push @results, [ \@samples, $chr, $zeroPos, \@record ];
-
     }
 
-    # say STDERR "Done";
-
-    # for my $sample (@$sampleListAref) {
-    #   $personalDb->dbEndCursorTxn($sample);
-    # }
-    # $personalDb->dbEndCursorTxn()
-
     MCE->gather( \%seen, \%txNumbers );
+
+    # Get in a good habit; need to free environment pointers for 
+    # LMDBB to clean up properly
+    # undef %dbs;
+    # $personalDb->cleanUp();
 
     close $MEM_FH;
   }
@@ -660,30 +634,15 @@ sub makePersonalProtDb {
 
   MCE::Loop::finish();
 
-  $personalDb->dbPut( $metaEnv, undef, $metaKeys{samplesWritten}, \%completed );
+  $personalDb = GenPro::DBManager->new();
 
-  $personalDb->dbPut( $metaEnv, undef, $metaKeys{wantedTxs}, \%wantedTxNumbers );
+  $metaDb = $personalDb->_getDbi( $metaEnv, undef, 1);
+    $personalDb->dbPut($metaDb, $metaKeys{samplesWritten}, \%completed );
+    $personalDb->dbPut($metaDb, $metaKeys{wantedTxs}, \%wantedTxNumbers );
+  undef $metaDb;
 
   $db->cleanUp();
-
-  # Unfortunately, MCE::Shared::stop() removes the value of $abortErr
-  # according to documentation, and I did not see mention of a way
-  # to copy the data from a scalar, and don't want to use a hash for this alone
-  # So, using a scalar ref to abortErr in the gather function.
-  # if ($abortErr) {
-  #   say "Aborted job due to $abortErr";
-  #   return ( 'Job aborted due to error', undef );
-  # }
-
-  ################ Finished writing file. If statistics, print those ##########
-  # Sync to ensure all files written
-  # This simply tries each close/sync/move operation in order
-  # And returns an error early, or proceeds to next operation
-  # $err =
-  #    $self->safeClose($outFh)
-  # || ( $statsFh && $self->safeClose($statsFh) )
-  # || $self->safeSystem('sync')
-  # || $self->_moveFilesToOutputDir();
+  $personalDb->cleanUp();
 
   return ( $err, \%completed, \%wantedTxNumbers );
 }
@@ -694,9 +653,11 @@ sub makeReferenceProtDb {
   my ($self, $wantedTxNumHref) = @_;
 
   my $personalDb = GenPro::DBManager->new();
-  $personalDb->_getDbi( $metaEnv, 'completed', 1 );
+  
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, 1);
+    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeys{refTxsWritten} );
+  undef $metaDb;
 
-  my $previouslyWritten = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{refTxsWritten} );
   my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
 
   my @txNums;
@@ -718,15 +679,26 @@ sub makeReferenceProtDb {
   my %regionDb;
   my $nChrs = @{$self->chromosomes};
   my $haveWritten = 0;
+
+  # Ensure that we crate the necessary databases before entering threads
+  # It *seems* I don't need to pre-make databases
+  # TODO: write tests
   for my $chr ( keys %wantedChrs ) {
     $regionDb{$chr} //= $db->dbReadAll( $geneTrackGetter->regionTrackPath($chr) );
 
-    $personalDb->_getDbi( $refProtEnv, 0, 0, $chr, $nChrs );
+    # Run here, in case we have yet to create this environment, before
+    # we get to multi-threaded code.
+    # Doesn't seem to be necessary
+    # $personalDb->_getDbi( $refProtEnv, 0, 0, $chr, $nChrs );
 
     if(defined $writtenChrs{$chr}) {
       $haveWritten++;
     }
   }
+
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+  undef $personalDb;
 
   if($haveWritten == keys %wantedChrs) {
     return;
@@ -775,18 +747,28 @@ sub makeReferenceProtDb {
   mce_loop {
     my ($mce, $chunk_ref, $chunk_id) = @_;
 
+    $personalDb = GenPro::DBManager->new();
+  
     my %seenCodonRanges;
     my %cursors;
     my %seenChrs;
+    my %dbs;
     for my $txNumInfo (@{ $chunk_ref }) {
       my $chr = $txNumInfo->[0];
       my $txNumber = $txNumInfo->[1];
 
       $seenChrs{$chr} //= 1;
 
+      # TODO: refactor into function so that same options always passed
+      # or at least hash of options for this environment
+      # Must pass nChrs, or get -30791 MDB_DBS_FULL (no more dbs)
+      $dbs{$chr} //= $personalDb->_getDbi( $refProtEnv, 0, 0, $chr, $nChrs );
+
       # To save
       my $tx = $regionDb{$chr}->[$txNumber];
+      my $txName = $tx->{$nameFeatIdx};
       my $strand = $tx->{$strandFeatIdx};
+      # p $tx;
 
       if(!defined $strand) {
         die "No strand, for tx #$txNumber";
@@ -820,7 +802,7 @@ sub makeReferenceProtDb {
       $db->dbReadCursorUnsafe($cursors{$chr}, \@data);
 
       my ( $fetchedTxNumbers, $siteData, $wantedSiteData );
-      my (@codonSequence, @aaSequence, @codonPos, @codonNums);
+      my (@codonSequence, @aaSequence, @codonPos, @codonNums, @txNumOut);
 
       my $lastCodonNumber;
       for my $site (@data) {
@@ -830,10 +812,6 @@ sub makeReferenceProtDb {
 
         ( $fetchedTxNumbers, $siteData ) = $siteUnpacker->unpack( $site->[ $geneTrackGetterDbName ] );
 
-        # if($txNumber == 2211) {
-        #   p $fetchedTxNumbers;
-        #   p $siteData;
-        # }
         if(!ref $fetchedTxNumbers) {
           if ($fetchedTxNumbers != $txNumber) {
             die "Err, expected all positions cdsStart ... cdsEnd - 1 to have an entry for tx $txNumber";
@@ -914,36 +892,64 @@ sub makeReferenceProtDb {
       # TODO: Move to testing package
       if($regionDb{$chr}[$txNumber]{$nameFeatIdx} eq 'NM_033467') {
         # https://www.ncbi.nlm.nih.gov/nuccore/NM_033467
-        ok(join('', @aaSequence eq 'MGKSEGPVGMVESAGRAGQKRPGFLEGGLLLLLLLVTAALVALGVLYADRRGKQLPRLASRLCFLQEERTFVKRKPRGIPEAQEVSEVCTTPGCVIAAARILQNMDPTTEPCDDFYQFACGGWLRRHVIPETNSRYSIFDVLRDELEVILKAVLENSTAKDRPAVEKARTLYRSCMNQSVIEKRGSQPLLDILEVVGGWPVAMDRWNETVGLEWELERQLALMNSQFNRRVLIDLFIWNDDQNSSRHIIYIDQPTLGMPSREYYFNGGSNRKVREAYLQFMVSVATLLREDANLPRDSCLVQEDMVQVLELETQLAKATVPQEERHDVIALYHRMGLEELQSQFGLKGFNWTLFIQTVLSSVKIKLLPDEEVVVYGIPYLQNLENIIDTYSARTIQNYLVWRLVLDRIGSLSQRFKDTRVNYRKALFGTMVEEVRWRECVGYVNSNMENAVGSLYVREAFPGDSKSMVRELIDKVRTVFVETLDELGWMDEESKKKAQEKAMSIREQIGHPDYILEEMNRRLDEEYSNLNFSEDLYFENSLQNLKVGAQRSLRKLREKVDPNLWIIGAAVVNAFYSPNRNQIVFPAGILQPPFFSKEQPQALNFGGIGMVIGHEITHGFDDNGRNFDKNGNMMDWWSNFSTQHFREQSECMIYQYGNYSWDLADEQNVNGFNTLGENIADNGGVRQAYKAYLKWMAEGGKDQQLPGLDLTHEQLFFINYAQVWCGSYRPEFAIQSIKTDVHSPLKYRVLGSLQNLAAFADTFHCARGTPMHPKERCRVW'));
+        ok(join('', @aaSequence) eq 'MGKSEGPVGMVESAGRAGQKRPGFLEGGLLLLLLLVTAALVALGVLYADRRGKQLPRLASRLCFLQEERTFVKRKPRGIPEAQEVSEVCTTPGCVIAAARILQNMDPTTEPCDDFYQFACGGWLRRHVIPETNSRYSIFDVLRDELEVILKAVLENSTAKDRPAVEKARTLYRSCMNQSVIEKRGSQPLLDILEVVGGWPVAMDRWNETVGLEWELERQLALMNSQFNRRVLIDLFIWNDDQNSSRHIIYIDQPTLGMPSREYYFNGGSNRKVREAYLQFMVSVATLLREDANLPRDSCLVQEDMVQVLELETQLAKATVPQEERHDVIALYHRMGLEELQSQFGLKGFNWTLFIQTVLSSVKIKLLPDEEVVVYGIPYLQNLENIIDTYSARTIQNYLVWRLVLDRIGSLSQRFKDTRVNYRKALFGTMVEEVRWRECVGYVNSNMENAVGSLYVREAFPGDSKSMVRELIDKVRTVFVETLDELGWMDEESKKKAQEKAMSIREQIGHPDYILEEMNRRLDEEYSNLNFSEDLYFENSLQNLKVGAQRSLRKLREKVDPNLWIIGAAVVNAFYSPNRNQIVFPAGILQPPFFSKEQPQALNFGGIGMVIGHEITHGFDDNGRNFDKNGNMMDWWSNFSTQHFREQSECMIYQYGNYSWDLADEQNVNGFNTLGENIADNGGVRQAYKAYLKWMAEGGKDQQLPGLDLTHEQLFFINYAQVWCGSYRPEFAIQSIKTDVHSPLKYRVLGSLQNLAAFADTFHCARGTPMHPKERCRVW*');
       }
 
-      $personalDb->dbPut($refPeptideEnv, $chr, $txNumber, [\@aaSequence, \@codonSequence]);
+      # store the primary key as well as denormalized info
+      # since we won't be using this db as a traditional, relational db
+      # although we could just ignore the de-normalized data
+      my $txn = $dbs{$chr}{env}->BeginTxn();
+        $personalDb->dbPutRaw($txn, $dbs{$chr}{dbi}, $txNumber, [\@aaSequence, \@codonSequence, [$txName, $cdsStart, $cdsEnd]]);
+      $txn->commit();
     }
 
     MCE->gather(\%seenChrs);
+
+    # Remove our pointers so LMDB can clean up properly
+    # undef %dbs;
+    # $personalDb->cleanUp();
   } @txNums;
 
   MCE::Loop::finish();
 
-  $personalDb->dbPut( $metaEnv, undef, $metaKeys{refTxsWritten}, \%writtenChrs );
+  $personalDb = GenPro::DBManager->new();
+
+  $metaDb = $personalDb->_getDbi( $metaEnv, undef, 1 );
+    $personalDb->dbPut( $metaDb, $metaKeys{refTxsWritten}, \%writtenChrs );
+  undef $metaDb;
 
   $personalDb->cleanUp();
+  $db->cleanUp();
 }
 
 # Generates everything that GenPro_make_refprotdb does
 # Also pre-calculates all digested peptides, and stores those
 sub makeReferenceUniquePeptides {
-  my ($self, $wantedSamples, $wantedTxNumHref) = @_;
-# p $wantedTxNumHref;
+  my ($self, $wantedSamples, $wantedTxNumHref, $wantedEnzymesAref) = @_;
+
+  $wantedEnzymesAref //= ['trypsin'];
+
+  # for now assume we'll have trypsin, chymotrypsin, lyse-c
+  my $nEnzymeTables = 3;
+
   my $personalDb = GenPro::DBManager->new();
-  $personalDb->_getDbi( $refPeptideEnv, undef, 1 );
 
-  $personalDb->_getDbi( $metaEnv, undef, 1 );
+  # TODO: size the database based on the number of possible enzymes
+  # TODO: think about combining refProtEnv and refPeptideEnv
+  for my $enzyme (@$wantedEnzymesAref) {
+    $personalDb->_getDbi( $refPeptideEnv, undef, 1, $enzyme, $nEnzymeTables );
+  }
 
-  my $previouslyWritten = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{refPeptidesWritten} );
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, 1 );
+    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeys{refPeptidesWritten} );
+  undef $metaDb;
+
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+  undef $personalDb;
 
   my %writtenTxNums = $previouslyWritten ? %$previouslyWritten : ();
-# p %writtenTxNums;
+
   my @txNums;
   my %wantedChrs;
   for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
@@ -960,16 +966,20 @@ sub makeReferenceUniquePeptides {
       $wantedChrs{$chr} //= 1;
     }
   }
-# p @txNums;
+
   if(@txNums == 0) {
     return;
   }
+  
+  # TODO: when working with named databases, must open each time with same flags
+  # and I think, same number of maxDbs (or at least, no fewer max dbs?)
+  my $nChrs = @{$self->chromosomes};
 
   my $progressFunc = sub {
-    my $seenChrs = shift;
+    my $seenTxNums = shift;
 
-    for my $chr (keys %$seenChrs) {
-      for my $txNum (keys %{$seenChrs->{$chr}}) {
+    for my $chr (keys %$seenTxNums) {
+      for my $txNum (keys %{$seenTxNums->{$chr}}) {
         $writtenTxNums{$chr}{$txNum} = 1;
       }
     }
@@ -987,244 +997,380 @@ sub makeReferenceUniquePeptides {
   mce_loop {
     my ($mce, $chunk_ref, $chunk_id) = @_;
 
-    my %seenChrs;
+    # Thread-local instance
+    $personalDb = GenPro::DBManager->new();
+
+    my %dbs;
+    my %refProtDbs;
+    my $existing;
+    my @peptides;
+    my $err;
+    my $data;
+    my $dbi;
+    my %seenTxNums;
     for my $txNumInfo (@{ $chunk_ref }) {
       my $chr = $txNumInfo->[0];
       my $txNumber = $txNumInfo->[1];
 
-      $seenChrs{$chr} //= 1;
+      if($seenTxNums{$chr}) {
+        $seenTxNums{$chr}{$txNumber} //= 1;
+      } else {
+        $seenTxNums{$chr} = {$txNumber => 1};
+        # TODO: refactor this into separate function so that same options passed each time
+        $refProtDbs{$chr} //= $personalDb->_getDbi( $refProtEnv, undef, 0, $chr, $nChrs );
+      }
 
-      my $seqInfo = $personalDb->dbReadOne($refProtEnv, $chr, $txNumber);
+      my $seqInfo = $personalDb->dbReadOne($refProtDbs{$chr}, $txNumber);
 
-      # p $seqInfo;
+      my $aaSeqAref = $seqInfo->[0];
+      my $txInfo = $seqInfo->[2];
+      for my $enzyme (@$wantedEnzymesAref) {
+        $dbs{$enzyme} //= $personalDb->_getDbi( $refPeptideEnv, undef, 1, $enzyme, $nEnzymeTables );
+        $dbi = $dbs{$enzyme}{dbi};
 
+        for my $peptide ($digestFuncs{$enzyme}->($aaSeqAref, $enzyme)) {
+          # say STDERR $peptide . "\n";
+          my $txn = $dbs{$enzyme}{env}->BeginTxn();
+
+          $data = $personalDb->dbReadOneRaw($txn, $dbi, $peptide);
+          
+          if(!defined $data) {
+            $personalDb->dbPutRaw($txn, $dbi, $peptide, [1, [$txInfo]]);
+            # say STDERR "Count: 0";
+          } else {
+            $data->[0] = $data->[0] + 1;
+            push @{$data->[1]}, $txInfo;
+
+            $personalDb->dbPutRaw($txn, $dbi, $peptide, $data);
+            # say STDERR "Count: ref: $data->[0]";
+            # p $data;
+          }
+
+          $err = $txn->commit();
+          # p $err;
+
+          if($err) {
+            die "Error on commit: $err";
+          }
+
+          # if ($LMDB_File::last_err) {
+          #   if ( $LMDB_File::last_err != MDB_KEYEXIST ) {
+
+          #     # TODO: return error from thread, synchronize with other threads $$abortErr
+          #     die "dbPatch put or commit LMDB error $LMDB_File::last_err";
+          #   }
+
+          #   #reset the class error variable, to avoid crazy error reporting later
+          #   $LMDB_File::last_err = 0;
+          # }
+        }
+      }
     }
 
-    MCE->gather(\%seenChrs);
+    MCE->gather(\%seenTxNums);
+
+    # Our cleanup function seems to cause issues
+    # undef %refProtDbs;
+    # undef %dbs;
+    # $personalDb->cleanUp()
   } @txNums;
 
   MCE::Loop::finish();
 
-  # $personalDb->dbPut( $metaEnv, undef, $metaKeys{refTxsWritten}, \%writtenChrs );
+  $personalDb = GenPro::DBManager->new();
+
+  $metaDb = $personalDb->_getDbi($metaEnv, undef, 1);
+    $personalDb->dbPut( $metaDb, $metaKeys{refPeptidesWritten}, \%writtenTxNums );
+  undef $metaDb;
+
+  $personalDb->cleanUp();
+}
+
+sub trypsin {
+  my ($aaAref, $enzyme) = @_;
+
+  my @cutSites;
+  my $lastCutSite = 0;
+
+  my $i = -1;
+  my $start;
+  my $seq;
+  my @peptides;
+  for my $aa (@$aaAref) {
+    $i++;
+
+    if($aa eq '*') {
+      last;
+    }
+
+    if($aa eq 'K' || $aa eq 'R') {
+      push @cutSites, $i + 1;
+      $lastCutSite = $i + 1;
+    }
+  }
+
+  # if a K or R at the end, don't include it twice but also include the
+  # end of the protein
+  if( $lastCutSite < @$aaAref) {
+    push @cutSites, scalar @$aaAref;
+  }
+
+  # reset
+  $lastCutSite = 0;
+  
+  $i = -1;
+  for my $end (@cutSites) {
+    $i++;
+
+    # Don't add + 1 because we take lastCutSite .. $end - 1, so this is already +1 length
+    # and because end in the above is $i + 1
+    if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
+      # No need to join into a string...that's a byte array anyway
+      # Just keep the reference to an array reference
+      push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+    }
+
+    if ( $end == @$aaAref ) {
+      last;
+    }
+
+    # If the next base is a proline that blocks
+    if( $aaAref->[$end] eq 'P' ) {
+      # any more cut sites?
+      if( $i + 1 < @cutSites) {
+        $end = $cutSites[ $i + 1 ];
+
+        if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
+          # No need to join into a string...that's a byte array anyway
+          # Just keep the reference to an array reference
+          push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ] );
+        }
+      }
+    }
+
+    $lastCutSite = $end;
+  }
+
+  return @peptides;
 }
 
 # Replicates:
 # 1) sub var_prot_for_tx, which:
 ## # var_prot_for_tx takes a variant record and returns an array of variant proteins;
 #### the caller may select the most parsimonious elements
-sub createPersProtPermutations {
-  my $self           = shift;
-  my $sampleListHref = shift;
-  my $wantedTxNumHref = shift;
+# sub createPersProtPermutations {
+#   my $self           = shift;
+#   my $sampleListHref = shift;
+#   my $wantedTxNumHref = shift;
 
-  my $err;
+#   my $err;
 
-  my $personalDb = GenPro::DBManager->new();
+#   my $personalDb = GenPro::DBManager->new();
 
-  my $db              = $self->{_db};
-  my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
+#   my $db              = $self->{_db};
+#   my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
 
-  my $completed = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{samplePeptidesWritten} );
+#   my $completed = $personalDb->dbReadOne( $metaEnv, undef, $metaKeys{samplePeptidesWritten} );
  
-  my $found = 0;
-  for my $sample (keys %$sampleListHref) {
-    if(defined $completed->{$sample}) {
-      $found++;
-    }
-  }
+#   my $found = 0;
+#   for my $sample (keys %$sampleListHref) {
+#     if(defined $completed->{$sample}) {
+#       $found++;
+#     }
+#   }
 
-  if($found == %$sampleListHref) {
-    return;
-  }
+#   if($found == %$sampleListHref) {
+#     return;
+#   }
 
-  # my $start = time();
-  my %refProtSeqData;
-  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
-    $refProtSeqData{$chr} //= {};
-    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
-      # push @txNums, [$chr, $txNum];
-      $refProtSeqData{$chr}{$txNum} =  $personalDb->dbReadOne($refProtEnv, $chr, $txNum);
-    }
-  }
+#   # my $start = time();
+#   my %refProtSeqData;
+#   for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
+#     $refProtSeqData{$chr} //= {};
+#     for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
+#       # push @txNums, [$chr, $txNum];
+#       $refProtSeqData{$chr}{$txNum} =  $personalDb->dbReadOne($refProtEnv, $chr, $txNum);
+#     }
+#   }
   
-  # say STDERR "PAST: " . (time() - $start) . " : num stuff: " . (keys %{$refProtSeqData{chr1}});
-  # sleep(5);
-  my %regionDb;
-  my %byTxRegion;
+#   # say STDERR "PAST: " . (time() - $start) . " : num stuff: " . (keys %{$refProtSeqData{chr1}});
+#   # sleep(5);
+#   my %regionDb;
+#   my %byTxRegion;
 
-  # These are always relative to the region database
-  # The computed features are totally separate
-  my $nameFeatIdx = $geneTrackGetter->getFieldDbName('name');
-  my $name2FeatIdx = $geneTrackGetter->getFieldDbName('name2');
-  my $strandFeatIdx = $geneTrackGetter->getFieldDbName('strand');
-  my $txErrorFeatIdx = $geneTrackGetter->getFieldDbName('txError');
+#   # These are always relative to the region database
+#   # The computed features are totally separate
+#   my $nameFeatIdx = $geneTrackGetter->getFieldDbName('name');
+#   my $name2FeatIdx = $geneTrackGetter->getFieldDbName('name2');
+#   my $strandFeatIdx = $geneTrackGetter->getFieldDbName('strand');
+#   my $txErrorFeatIdx = $geneTrackGetter->getFieldDbName('txError');
 
-  my $exonStartsFeatIdx = $geneTrackGetter->getFieldDbName('exonStarts');
-  my $exonEndsFeatIdx = $geneTrackGetter->getFieldDbName('exonEnds');
+#   my $exonStartsFeatIdx = $geneTrackGetter->getFieldDbName('exonStarts');
+#   my $exonEndsFeatIdx = $geneTrackGetter->getFieldDbName('exonEnds');
 
-  my $cdsStartFeatIdx = $geneTrackGetter->getFieldDbName('cdsStart');
-  my $cdsEndFeatIdx = $geneTrackGetter->getFieldDbName('cdsEnd');
-
-
-  # TODO: store the order of these in meta table
-  # since that is effectively the feature index
-  # my @wanted = (
-  #   $exonicAlleleFuncIdx, $strandIdx, $codonNumIdx, $refCodonIdx, $altCodonIdx, $refAaIdx, $altAaIdx,
-  #   $nameIdx, $name2idx, $codonPosIdx
-  # );
-  my @wanted = (
-    'chr', 'pos', 'type', 'ref', 'alt',
-    'exonicAlleleFunction', 'strand', 'codonNum', 'refCodon', 'altCodon', 'refAa', 'altAa',
-    'name', 'name2', 'codonPos', 'txNumber', 'het'
-  );
-
-  my %wanted;
-  for (my $i = 0; $i < @wanted; $i++) {
-    $wanted{$wanted[$i]} = $i;
-  }
-
-  # These are never arrays
-  my $chrIdx = $wanted{'chr'};
-  my $posIdx = $wanted{'pos'};
-  my $typeIdx = $wanted{'type'};
-  my $refIdx = $wanted{'ref'};
-  my $altIdx = $wanted{'alt'};
-  my $hetIdx = $wanted{'het'};
-
-  # These can be arrays, if there are multiple transcripts
-  my $nameIdx = $wanted{'name'};
-  my $altAaIdx = $wanted{'altAa'};
-  my $altCodonIdx = $wanted{'altCodon'};
-  my $codonPosIdx = $wanted{'codonPos'};
-  my $codonNumIdx = $wanted{'codonNum'};
-  my $txNumberIdx = $wanted{'txNumber'};
-  my $strandIdx = $wanted{'strand'};
-
-  my $siteUnpacker = Seq::Tracks::Gene::Site->new();
-  my $siteTypeMap  = Seq::Tracks::Gene::Site::SiteTypeMap->new();
-  my $codonMap     = Seq::Tracks::Gene::Site::CodonMap->new();
-
-  my $strandSiteIdx        = $siteUnpacker->strandIdx;
-  my $siteTypeSiteIdx      = $siteUnpacker->siteTypeIdx;
-  my $codonSequenceSiteIdx = $siteUnpacker->codonSequenceIdx;
-  my $codonPositionSiteIdx = $siteUnpacker->codonPositionIdx;
-  my $codonNumberSiteIdx   = $siteUnpacker->codonNumberIdx;
-
-  my $geneTrackGetterDbName = $geneTrackGetter->dbName;
-
-  # Report every 1e4 lines, to avoid thrashing receiver
-  my %wantedTranscripts;
-  my %sampleData;
-  my $progressFunc = sub {
-    my ($chr, $sample, $userTxHref);
-
-    my @txNums = keys %$userTxHref;
-
-    $wantedTranscripts{$chr} //= {};
+#   my $cdsStartFeatIdx = $geneTrackGetter->getFieldDbName('cdsStart');
+#   my $cdsEndFeatIdx = $geneTrackGetter->getFieldDbName('cdsEnd');
 
 
-    for my $txNum (@txNums) {
-      $wantedTranscripts{$chr}{$txNum} //= 1
-    }
+#   # TODO: store the order of these in meta table
+#   # since that is effectively the feature index
+#   # my @wanted = (
+#   #   $exonicAlleleFuncIdx, $strandIdx, $codonNumIdx, $refCodonIdx, $altCodonIdx, $refAaIdx, $altAaIdx,
+#   #   $nameIdx, $name2idx, $codonPosIdx
+#   # );
+#   my @wanted = (
+#     'chr', 'pos', 'type', 'ref', 'alt',
+#     'exonicAlleleFunction', 'strand', 'codonNum', 'refCodon', 'altCodon', 'refAa', 'altAa',
+#     'name', 'name2', 'codonPos', 'txNumber', 'het'
+#   );
 
-    $sampleData{$sample} //= {};
-    $sampleData{$sample} = $userTxHref;
-  };
+#   my %wanted;
+#   for (my $i = 0; $i < @wanted; $i++) {
+#     $wanted{$wanted[$i]} = $i;
+#   }
 
-  MCE::Loop::init {
-    max_workers => $self->maxThreads || 8,
+#   # These are never arrays
+#   my $chrIdx = $wanted{'chr'};
+#   my $posIdx = $wanted{'pos'};
+#   my $typeIdx = $wanted{'type'};
+#   my $refIdx = $wanted{'ref'};
+#   my $altIdx = $wanted{'alt'};
+#   my $hetIdx = $wanted{'het'};
 
-    # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
-    # so accumulate less than we would if processing full .snp
-    chunk_size => 1,
-    gather     => $progressFunc,
-  };
+#   # These can be arrays, if there are multiple transcripts
+#   my $nameIdx = $wanted{'name'};
+#   my $altAaIdx = $wanted{'altAa'};
+#   my $altCodonIdx = $wanted{'altCodon'};
+#   my $codonPosIdx = $wanted{'codonPos'};
+#   my $codonNumIdx = $wanted{'codonNum'};
+#   my $txNumberIdx = $wanted{'txNumber'};
+#   my $strandIdx = $wanted{'strand'};
 
-  mce_loop {
-    my ( $mce, $chunk_ref, $chunk_id ) = @_;
+#   my $siteUnpacker = Seq::Tracks::Gene::Site->new();
+#   my $siteTypeMap  = Seq::Tracks::Gene::Site::SiteTypeMap->new();
+#   my $codonMap     = Seq::Tracks::Gene::Site::CodonMap->new();
 
-    my $sample = $_;
-    # Each thread gets its own cursor
-    my  %cursors = ();
+#   my $strandSiteIdx        = $siteUnpacker->strandIdx;
+#   my $siteTypeSiteIdx      = $siteUnpacker->siteTypeIdx;
+#   my $codonSequenceSiteIdx = $siteUnpacker->codonSequenceIdx;
+#   my $codonPositionSiteIdx = $siteUnpacker->codonPositionIdx;
+#   my $codonNumberSiteIdx   = $siteUnpacker->codonNumberIdx;
 
-    # TODO: optimize wanted chromosomes
-    for my $chr ( @{ $self->chromosomes } ) {
-      my $dataAref = $personalDb->dbReadAll( $sample, $chr );
+#   my $geneTrackGetterDbName = $geneTrackGetter->dbName;
 
-      p $dataAref;
+#   # Report every 1e4 lines, to avoid thrashing receiver
+#   my %wantedTranscripts;
+#   my %sampleData;
+#   my $progressFunc = sub {
+#     my ($chr, $sample, $userTxHref);
 
-      if(!defined $dataAref) {
-        next;
-      }
+#     my @txNums = keys %$userTxHref;
 
-      # Place all data into
-      # txName => [first modification, 2nd modification, etc]
-      # Where each modification = [chr, pos, name, codonNum, codonPos, altCodon, altAa]
-      my %userTx;
+#     $wantedTranscripts{$chr} //= {};
 
-      # Caveat: It seems that, per database ($chr), we can have only one
-      # read-only transaction; so ... yeah can't combine with dbRead, dbReadOne
-      if ( !$cursors{$chr} ) {
-        $cursors{$chr} = $db->dbStartCursorTxn($chr);
-      }
 
-      for my $data (@$dataAref) {
-        my $name = $data->[0][$nameIdx];
-        my $altAa = $data->[0][$altAaIdx];
-        my $altCodon = $data->[0][$altCodonIdx];
-        # my $codonPos = $data->[0][$codonPosIdx];
-        my $codonNum = $data->[0][$codonNumIdx];
-        # my $pos = $data->[0][$posIdx];
+#     for my $txNum (@txNums) {
+#       $wantedTranscripts{$chr}{$txNum} //= 1
+#     }
 
-        my $txNumber = $data->[0][$txNumberIdx];
-        my $strand = $data->[0][$strandIdx];
+#     $sampleData{$sample} //= {};
+#     $sampleData{$sample} = $userTxHref;
+#   };
 
-        if(ref $name) {
-          # p $data;
-          for (my $i = 0; $i < @$name; $i++) {
-            $userTx{$txNumber->[$i]} //= [];
+#   MCE::Loop::init {
+#     max_workers => $self->maxThreads || 8,
 
-            my @details = (
-              $txNumber->[$i], $name->[$i], $altCodon->[$i], $altAa->[$i], $strand->[$i]
-            );
+#     # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
+#     # so accumulate less than we would if processing full .snp
+#     chunk_size => 1,
+#     gather     => $progressFunc,
+#   };
 
-            push @{$userTx{$txNumber->[$i]}}, \@details;
-          }
-        } else {
-          $userTx{$txNumber} //= [];
+#   mce_loop {
+#     my ( $mce, $chunk_ref, $chunk_id ) = @_;
 
-          # If any of the inner stuff is an array, it is guaranteed to 
-          # correspond to the $name
-          # for instance, if multiple spId's, they all belong to the 1 $name
-          my @details = (
-            $txNumber, $name, $altCodon, $altAa, $strand
-          );
+#     my $sample = $_;
+#     # Each thread gets its own cursor
+#     my  %cursors = ();
 
-          push @{$userTx{$txNumber}}, \@details;
-        }
-      }
+#     # TODO: optimize wanted chromosomes
+#     for my $chr ( @{ $self->chromosomes } ) {
+#       my $dataAref = $personalDb->dbReadAll( $sample, $chr );
 
-      # TODO: it may be more efficient to build all transcripts at
-      # once, at cost of memory
-      # To not discard info / waste iterations when transcripts overlap
-      my @txNums = keys %userTx;
+#       p $dataAref;
+
+#       if(!defined $dataAref) {
+#         next;
+#       }
+
+#       # Place all data into
+#       # txName => [first modification, 2nd modification, etc]
+#       # Where each modification = [chr, pos, name, codonNum, codonPos, altCodon, altAa]
+#       my %userTx;
+
+#       # Caveat: It seems that, per database ($chr), we can have only one
+#       # read-only transaction; so ... yeah can't combine with dbRead, dbReadOne
+#       if ( !$cursors{$chr} ) {
+#         $cursors{$chr} = $db->dbStartCursorTxn($chr);
+#       }
+
+#       for my $data (@$dataAref) {
+#         my $name = $data->[0][$nameIdx];
+#         my $altAa = $data->[0][$altAaIdx];
+#         my $altCodon = $data->[0][$altCodonIdx];
+#         # my $codonPos = $data->[0][$codonPosIdx];
+#         my $codonNum = $data->[0][$codonNumIdx];
+#         # my $pos = $data->[0][$posIdx];
+
+#         my $txNumber = $data->[0][$txNumberIdx];
+#         my $strand = $data->[0][$strandIdx];
+
+#         if(ref $name) {
+#           # p $data;
+#           for (my $i = 0; $i < @$name; $i++) {
+#             $userTx{$txNumber->[$i]} //= [];
+
+#             my @details = (
+#               $txNumber->[$i], $name->[$i], $altCodon->[$i], $altAa->[$i], $strand->[$i]
+#             );
+
+#             push @{$userTx{$txNumber->[$i]}}, \@details;
+#           }
+#         } else {
+#           $userTx{$txNumber} //= [];
+
+#           # If any of the inner stuff is an array, it is guaranteed to 
+#           # correspond to the $name
+#           # for instance, if multiple spId's, they all belong to the 1 $name
+#           my @details = (
+#             $txNumber, $name, $altCodon, $altAa, $strand
+#           );
+
+#           push @{$userTx{$txNumber}}, \@details;
+#         }
+#       }
+
+#       # TODO: it may be more efficient to build all transcripts at
+#       # once, at cost of memory
+#       # To not discard info / waste iterations when transcripts overlap
+#       my @txNums = keys %userTx;
       
-      for my $txNum (@txNums) {
-        my $refSeqData = $refProtSeqData{$chr}{$txNum};
+#       for my $txNum (@txNums) {
+#         my $refSeqData = $refProtSeqData{$chr}{$txNum};
 
-        p $refSeqData;
-        sleep(10);
-      }
+#         p $refSeqData;
+#         sleep(10);
+#       }
 
-      # MCE->gather($sample, $chr, \%userTx);
-    }
-  }
-  sort { $a cmp $b } keys %$sampleListHref;
+#       # MCE->gather($sample, $chr, \%userTx);
+#     }
+#   }
+#   sort { $a cmp $b } keys %$sampleListHref;
 
-  MCE::Loop::finish();
+#   MCE::Loop::finish();
 
-  return ($err);
-}
+#   return ($err);
+# }
 
 sub makeDbWriter {
   my ( $self, $samplesSeenHref, $txNumbersSeenHref ) = @_;
@@ -1310,103 +1456,6 @@ sub new_global_peptide {
 
 # in-silico trypsin digestion
 
-# Trypsin takes a string and cuts it into peptides as fully tryptic peptides
-# while allowing for blockage by protline, results returned as either hash or
-# hash reference depending on calling context
-sub Trypsin {
-  # An array reference where each entry is an amino acid
-  my $aaAref = shift;
-
-  my %digest;
-
-  # Dont' check for "*", we'll just skip the "*" which should be last entry
-  # May be safe to just skip last entry, but let's check in case
-  # # always trim off anything after a '*'; the if ( index ...) > -1) is (probably)
-  # # speeding things up since most of the time there's no '*' and using the
-  # # regex is comparitively slow versus just checking whether the string exists
-  # if ( index( $peptide, '*' ) > -1 ) {
-  #   $peptide =~ s/$trim_end_regex//xm;
-  # }
-  
-  # replaced by $aaAref my @peptide = split( //, $peptide );
-  
-  my @peptides;
-  my $last_cut_site = 0;
-  
-  # The first base in the peptide we're building
-  my $nextStart = 0;
-
-  my $i = -1;
-  my @peptide;
-  for my $aa (@$aaAref) {
-    $i++;
-
-    if($aa eq '*') {
-      last;
-    }
-
-    push @peptide, $aa;
-
-    if($aa eq 'K' || $aa eq 'R') {
-      push @peptides, \@peptide;
-      @peptide = ();
-
-      $nextStart = $i + 1;
-    
-    }
-  }
-  for ( my $i = 0 ; $i < @$aaAref ; $i++ ) {
-    if ( $aaAref ) {
-      push @cut_sites, $i + 1;
-      $last_cut_site = $i + 1;
-    }
-  }
-
-  # if a K or R at the end, don't include it twice but also include the
-  # end of the protein
-  if ( $last_cut_site < @peptide ) {
-    push @cut_sites, scalar @peptide;
-  }
-
-  # reset
-  $last_cut_site = 0;
-
-  for ( my $i = 0 ; $i < @cut_sites ; $i++ ) {
-    my $start = $last_cut_site;
-    my $end   = $cut_sites[$i];
-    my $seq   = join "", @peptide[ $start .. $end - 1 ];
-
-    if ( length $seq >= $min_peptide_length && length $seq <= $max_peptide_length ) {
-      my $coord = sprintf( "%d:%d", $start + 1, $end );
-      $digest{$coord} = $seq;
-    }
-
-    if ( @peptide == $end ) {
-      last;
-    }
-
-    if ( BlockCutAa( $peptide[$end] ) ) {
-
-      # any more cut sites?
-      if ( $i + 1 <= @cut_sites ) {
-        my $end = $cut_sites[ $i + 1 ];
-        my $seq = join "", @peptide[ $start .. $end - 1 ];
-        if ( length $seq >= $min_peptide_length && length $seq <= $max_peptide_length ) {
-          my $coord = sprintf( "%d:%d", $start + 1, $end );
-          $digest{$coord} = $seq;
-        }
-      }
-    }
-    $last_cut_site = $end;
-  }
-  if (wantarray) {
-    return %digest;
-  } elsif ( defined wantarray ) {
-    return \%digest;
-  } else {
-    die "Trypsin() should be called in the list or scalar context";
-  }
-}
 
 sub CutAa {
   my $aa = shift;
