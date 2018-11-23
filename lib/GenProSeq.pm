@@ -24,6 +24,8 @@ use Seq::Headers;
 
 use lib './lib';
 use GenPro::DBManager;
+use GenPro::Digest;
+
 use Seq::Tracks::Gene::Site;
 use Seq::Tracks::Gene::Site::CodonMap;
 use Seq::DBManager;
@@ -31,6 +33,8 @@ use Path::Tiny;
 use Scalar::Util qw/looks_like_number/;
 use DDP;
 use Test::More;
+
+use List::Util qw/sum/;
 
 use LMDB_File qw(:all);
 $LMDB_File::die_on_err = 0;
@@ -77,13 +81,24 @@ my $refProtEnv = 'referenceProteins';
 my $refPeptideEnv = 'referencePeptides';
 
 
-my $minPeptideLength = 6;
-my $maxPeptideLength = 40;
+
 my $trim_end_regex     = qr{\*[\*\w]*\z};
 
-my %digestFuncs = (
-  'trypsin' => \&trypsin,
-);
+
+my @allDigestFuncs = ('trypsin');
+
+has sampleDbConfig => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1,
+default => sub {
+  my $self = shift;
+
+  my $nChrs = @{$self->chromosomes};
+
+  return {
+    # + 5 because we need 1 global peptide database, and want to leave some headroom,
+    maxDbs => $nChrs + 5,
+    stringKeys => 0
+  }
+});
 
 # my $mp = Data::MessagePack->new()->prefer_integer()->prefer_float32();
 
@@ -161,6 +176,8 @@ sub annotate {
   
   ( $err ) = $self->makeReferenceUniquePeptides($sampleList, $wantedTxNums);
   say STDERR "FINISHED STEP 3 (make reference peptide database for trypsin for requested txNumbers)";
+  
+  ( $err ) = $self->makeSampleUniquePeptides($sampleList, $wantedTxNums);
 
   # We may get rid of this step
   # ( $err ) = $self->createPersProtPermutations($sampleList, $wantedTxNums);
@@ -336,6 +353,7 @@ sub makePersonalProtDb {
 
   my $db = $self->{_db};
 
+  my %sConfig = %{$self->sampleDbConfig};
   mce_loop_f {
 
     my ( $mce, $slurp_ref, $chunk_id ) = @_;
@@ -347,9 +365,6 @@ sub makePersonalProtDb {
 
     my $total = 0;
 
-    # my @indelDbData;
-    # my @indelRef;
-    # my @lines;
     my $dataFromDbAref;
     my $zeroPos;
     my $chr;
@@ -607,10 +622,16 @@ sub makePersonalProtDb {
         # in case of multiallelics
         if(!$dbs{$sample}) {
           $dbs{$sample} = {
-            $chr => $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr )
+            $chr => $personalDb->_getDbi( $sample, 0, 0,
+              $chr,
+              $sConfig{maxDbs},
+            )
           };
         } elsif(!$dbs{$sample}{$chr}) {
-          $dbs{$sample}{$chr} = $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
+          $dbs{$sample}{$chr} = $personalDb->_getDbi( $sample, 0, 0,
+              $chr,
+              $sConfig{maxDbs},
+            )
         }
 
         # We don't currently support multiallelics
@@ -757,6 +778,9 @@ sub makeReferenceProtDb {
       my $chr = $txNumInfo->[0];
       my $txNumber = $txNumInfo->[1];
 
+      if($txNumber == 438) {
+        say STDERR "Working on txNumber 438";
+      }
       $seenChrs{$chr} //= 1;
 
       # TODO: refactor into function so that same options always passed
@@ -788,9 +812,10 @@ sub makeReferenceProtDb {
       $seenCodonRanges{$chr} //= {};
       $seenCodonRanges{$chr}{$cdsStart} //= {};
 
-      if($seenCodonRanges{$chr}{$cdsStart}{$cdsEnd}) {
-        next;
-      }
+      # Don't do this!!!
+      # if($seenCodonRanges{$chr}{$cdsStart}{$cdsEnd}) {
+      #   next;
+      # }
 
       $seenCodonRanges{$chr}{$cdsStart}{$cdsEnd} = 1;
 
@@ -898,9 +923,19 @@ sub makeReferenceProtDb {
       # store the primary key as well as denormalized info
       # since we won't be using this db as a traditional, relational db
       # although we could just ignore the de-normalized data
-      my $txn = $dbs{$chr}{env}->BeginTxn();
-        $personalDb->dbPutRaw($txn, $dbs{$chr}{dbi}, $txNumber, [\@aaSequence, \@codonSequence, [$txName, $cdsStart, $cdsEnd]]);
-      $txn->commit();
+      # my $txn = $dbs{$chr}{env}->BeginTxn();
+      $personalDb->dbPut($dbs{$chr}, $txNumber, [\@aaSequence, \@codonSequence, [$txName, $cdsStart, $cdsEnd]]);
+      
+      # if($txNumber == 438) {
+      #   say STDERR "Put in txNumber 438";
+
+      #   my $val =  $personalDb->dbReadOne($dbs{$chr}, $txNumber);
+
+      #   p $val;
+      #   sleep(5);
+      # }
+      
+      # $txn->commit();
     }
 
     MCE->gather(\%seenChrs);
@@ -928,6 +963,13 @@ sub makeReferenceUniquePeptides {
   my ($self, $wantedSamples, $wantedTxNumHref, $wantedEnzymesAref) = @_;
 
   $wantedEnzymesAref //= ['trypsin'];
+
+  my %digestFuncs;
+  my $digest = GenPro::Digest->new();
+
+  for my $enzyme (@$wantedEnzymesAref) {
+    $digestFuncs{$enzyme} = $digest->makeDigestFunc($enzyme);
+  }
 
   # for now assume we'll have trypsin, chymotrypsin, lyse-c
   my $nEnzymeTables = 3;
@@ -1028,7 +1070,7 @@ sub makeReferenceUniquePeptides {
         $dbs{$enzyme} //= $personalDb->_getDbi( $refPeptideEnv, undef, 1, $enzyme, $nEnzymeTables );
         $dbi = $dbs{$enzyme}{dbi};
 
-        for my $peptide ($digestFuncs{$enzyme}->($aaSeqAref, $enzyme)) {
+        for my $peptide ($digestFuncs{$enzyme}->($aaSeqAref)) {
           # say STDERR $peptide . "\n";
           my $txn = $dbs{$enzyme}{env}->BeginTxn();
 
@@ -1086,73 +1128,546 @@ sub makeReferenceUniquePeptides {
   $personalDb->cleanUp();
 }
 
-sub trypsin {
-  my ($aaAref, $enzyme) = @_;
+# TODO: check if number wantedTxNumHref has changed
+# and if so, don't go by the sample meta
+sub makeSampleUniquePeptides {
+  my ($self, $wantedSamplesHref, $wantedTxNumHref, $wantedEnzymesAref) = @_;
 
-  my @cutSites;
-  my $lastCutSite = 0;
+  $wantedEnzymesAref //= ['trypsin'];
 
-  my $i = -1;
-  my $start;
-  my $seq;
-  my @peptides;
-  for my $aa (@$aaAref) {
-    $i++;
-
-    if($aa eq '*') {
-      last;
-    }
-
-    if($aa eq 'K' || $aa eq 'R') {
-      push @cutSites, $i + 1;
-      $lastCutSite = $i + 1;
-    }
-  }
-
-  # if a K or R at the end, don't include it twice but also include the
-  # end of the protein
-  if( $lastCutSite < @$aaAref) {
-    push @cutSites, scalar @$aaAref;
-  }
-
-  # reset
-  $lastCutSite = 0;
   
-  $i = -1;
-  for my $end (@cutSites) {
-    $i++;
 
-    # Don't add + 1 because we take lastCutSite .. $end - 1, so this is already +1 length
-    # and because end in the above is $i + 1
-    if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
-      # No need to join into a string...that's a byte array anyway
-      # Just keep the reference to an array reference
-      push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+  # When working with named databases, need to pass same configuration each time
+  # This is to know the maxDbs config for the reference peptide database
+  # which stores n peptides ('for now just trypsin');
+  # and maybe needs to be at least no less than the largest number it was last
+  # opened with (or maybe needs to be constant)
+  # TODO: Make this a configuration owned by the reference peptide database
+  my $nEnzymeTables = 3;
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, 1 );
+    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeys{samplePeptidesWritten} );
+  undef $metaDb;
+
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+  undef $personalDb;
+
+  my %writtenSamples = $previouslyWritten ? %$previouslyWritten : ();
+
+  my @toGetSamples;
+  for my $sample (keys %$wantedSamplesHref) {
+    if(defined $writtenSamples{$sample}) {
+      next;
     }
 
-    if ( $end == @$aaAref ) {
-      last;
+    push @toGetSamples, $sample;
+  }
+
+  if(@toGetSamples == 0) {
+    return;
+  }
+
+  # When working with named databases, need to pass same configuration each time
+  # This is to know the maxDbs config for the reference protein database
+  # and maybe needs to be at least no less than the largest number it was last
+  # opened with (or maybe needs to be constant)
+  # TODO: Make this a configuration owned by the reference protein database
+  my $nChrs = @{$self->chromosomes};
+
+  my @wanted = (
+    'chr', 'pos', 'type', 'ref', 'alt',
+    'exonicAlleleFunction', 'strand', 'codonNum', 'refCodon', 'altCodon', 'refAa', 'altAa',
+    'name', 'name2', 'codonPos', 'txNumber', 'het'
+  );
+
+  my %wanted;
+  for (my $i = 0; $i < @wanted; $i++) {
+    $wanted{$wanted[$i]} = $i;
+  }
+
+  # TODO: add other enzymes
+  my $digest = GenPro::Digest->new();
+  my $digestFunc = $digest->makeDigestFunc('trypsin');
+  my $cutsHref = $digest->digestLookups->{'trypsin'}{'cut'};
+
+  if(!$digestFunc) {
+    die 'No digest func for trypsin';
+  }
+
+  my $txNumberIdx = $wanted{'txNumber'};
+  my $altAaIdx = $wanted{'altAa'};
+  my $refAaIdx = $wanted{'refAa'};
+  my $codonNumIdx = $wanted{'codonNum'};
+  
+  my %txHasUniqueConfigTemplate = (
+    altAaIdx => $altAaIdx,
+    refAaIdx => $refAaIdx,
+    codonNumIdx => $codonNumIdx,
+    cutHref => $cutsHref,
+    maxPeptideLength => $digest->maxPeptideLength,
+  );
+  
+   my $progressFunc = sub {
+    my $seenSamples = shift;
+
+    for my $sample (keys %$seenSamples) {
+      for my $chr (keys %{$seenSamples->{$sample}}) {
+        $writtenSamples{$sample}{$chr} = 1;
+      }
     }
+  };
 
-    # If the next base is a proline that blocks
-    if( $aaAref->[$end] eq 'P' ) {
-      # any more cut sites?
-      if( $i + 1 < @cutSites) {
-        $end = $cutSites[ $i + 1 ];
+  MCE::Loop::init {
+    max_workers => $self->maxThreads || 8,
 
-        if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
-          # No need to join into a string...that's a byte array anyway
-          # Just keep the reference to an array reference
-          push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ] );
+    # bystro-vcf outputs a very small row; fully annotated through the alt column (-ref -discordant)
+    # so accumulate less than we would if processing full .snp
+    chunk_size => 'auto',
+    gather     => $progressFunc,
+  };
+
+  
+  my @wantedChrs = keys %$wantedTxNumHref;
+  mce_loop {
+    my ($mce, $chunk_ref, $chunk_id) = @_;
+
+    # Thread-local instance
+    $personalDb = GenPro::DBManager->new();
+
+    my $existing;
+    my @peptides;
+    my %seenSamples;
+
+    my $refPeptideDb = $personalDb->_getDbi( $refPeptideEnv, undef, 1, 'trypsin', $nEnzymeTables );
+    my $refPeptideDbi = $refPeptideDb->{dbi};
+    my $refPeptideTxn = $refPeptideDb->{env}->BeginTxn();
+
+    my %refProteinDbs;
+
+    my %sConf = %{$self->sampleDbConfig};
+    
+
+    my $globalUniquePeptideFn = sub {
+      my $aaAref = shift;
+
+      my @unique;
+      for my $peptide ($digestFunc->($aaAref)) {
+        if(!defined $personalDb->dbReadOneRaw($refPeptideTxn, $refPeptideDbi, $peptide)) {
+          push @unique, $peptide;
+        }
+      }
+    };
+
+    my %txHasUniqueConfig = (%txHasUniqueConfigTemplate, (globalUniquePeptideFn => $globalUniquePeptideFn));
+    my $txHasUniquePeptidesFn = makeVarProtForTxFn(\%txHasUniqueConfig);
+
+    p %txHasUniqueConfig;
+
+    for my $sample (@{ $chunk_ref }) {
+      my @finalRecords;
+
+      my $samplePeptideDb = $personalDb->_getDbi( $sample, undef, 1, 'peptides', $sConf{maxDbs} );
+
+      # TODO: take chromosomes from those written
+      for my $chr (@wantedChrs) {
+        $refProteinDbs{$chr} //= $personalDb->_getDbi( $refProtEnv, 0, 0, $chr, $nChrs );
+
+        my $sampleDb = $personalDb->_getDbi( $sample, undef, 0, $chr, $sConf{maxDbs} );
+
+        my $variantsAref = $personalDb->dbReadAll($sampleDb);
+
+        if(!defined $variantsAref) {
+          say STDERR "Found no txs for $sample on chr $chr";
+          next;
+        }
+        
+        # Place all data into
+        # txName => [first modification, 2nd modification, etc]
+        # Where each modification = contains a reference to the record
+        # from the 
+        my $userTxHref = _orderByDesired($variantsAref, $txNumberIdx);
+
+        for my $txNum (sort {$a <=> $b} keys %$userTxHref) {
+          my $userVars = $userTxHref->{$txNum};
+
+          p $userVars;
+          if(@$userVars > 21) {
+            say STDERR "Tx number $txNum on chr $chr has too many variants ( " . @$userVars . ')';
+            next;
+          } 
+
+          my $refSequenceInfo = $personalDb->dbReadOne($refProteinDbs{$chr}, $txNum);
+
+          if(!$refSequenceInfo) {
+            die "Couldn't find transcript number $txNum for chr $chr";
+          }
+
+          my $uniquePeptidesAref = $txHasUniquePeptidesFn->($userVars, $refSequenceInfo->[0]);
+          
+          if(!$uniquePeptidesAref) {
+            say STDERR "Couldn't find any peptides";
+            next;
+          }
+
+          # This replicates select_entries as well as create_per_prot_rec
+          # Since create_per_prot_rec is no longer necessary,
+          # as $txHasUniquePeptidesFn stores 
+          # \@{all affected txs}, \@{alt aa sequence}, \@uniquePeptides
+          # where uniquePeptides is also modified by sortByUniquePeptides 
+          my @sortedRecs = sortUniquePeptides($personalDb, $samplePeptideDb, $uniquePeptidesAref);
+
+          while(@sortedRecs) {
+            my $rec = shift @sortedRecs;
+            push @finalRecords, $rec;
+
+            # Note: This is ok, because sortByUnique peptides
+            # will remove all peptides previously seen in this sample
+            for my $peptide (@${$rec->[2]}) {
+              $personalDb->dbPut($samplePeptideDb, $peptide, [1, $txNum]);
+            }
+
+            # Checks all of the pre-generated peptides
+            # And:
+            # 1) returns only those records with at least 1 unique peptide
+            # 2) for each of those records, index 2 points to an array
+            # of the unique peptides pertaining to that record
+            # Should replicate Thomas' code, except avoiding 2nd round of digestion
+            # and 2nd round of checking against the reference db, which is invariant
+            # (so this function checks only against the sample db, which is
+            # updated in the line above thise)
+            @sortedRecs = sortUniquePeptides($personalDb, $samplePeptideDb, \@sortedRecs);    
+          }
+          say STDERR "Final records are";
+          p @finalRecords;
         }
       }
     }
 
-    $lastCutSite = $end;
+  } @toGetSamples;
+
+  MCE::Loop::finish();
+
+  $personalDb = GenPro::DBManager->new();
+
+  # $metaDb = $personalDb->_getDbi($metaEnv, undef, 1);
+  #   $personalDb->dbPut( $metaDb, $metaKeys{refPeptidesWritten}, \%writtenSamples );
+  # undef $metaDb;
+
+  $personalDb->cleanUp();
+}
+
+# Takes a variant record, with N affected transcripts,
+# de-convolutes those,
+# returning per-transcript data, indexed on some desired transcript value
+# ex: _orderBy($dataAref, txNumberIdx);
+# @returns <HashRef> : per-desired tx value variant records;
+sub _orderByDesired {
+  my ($dataAref, $desiredIdx) = @_;
+
+  my %ret;
+  for my $data (@$dataAref) {
+    my $desired = $data->[$desiredIdx];
+
+    if(ref $desired) {
+      # p $data;
+      for (my $i = 0; $i < @$desired; $i++) {
+        $ret{$desired->[$i]} //= [];
+
+        # A few of the properties are not arrays (chr, pos, ref, alt, type)
+        # and all others are
+        # TODO: be more precise about this...potentially wait for Rust
+        push @{$ret{$desired->[$i]}}, [ map { ref $_ ? $_->[$i] : $_ } @$data ];
+      }
+    } else {
+      $ret{$desired} //= [];
+
+      push @{$ret{$desired}}, $data;
+    }
   }
 
-  return @peptides;
+  return \%ret;
 }
+
+# Only sorts peptides, and updates counts, txNumbers of non-unique peptides
+sub sortUniquePeptides {
+  my ($recsAref, $txNum, $dbManager, $db);
+
+  my @finalRecords;
+
+  for my $rec (sort { @{$b->[2]} <=> @{$a->[2]} } @$recsAref) {
+    # Check each peptide against 
+    my @uniquePeptides;
+
+    for my $peptide (@${$rec->[2]}) {
+      my $seenAref = $dbManager->dbReadOne($db, $peptide);
+
+      if(defined $seenAref) {
+        $seenAref->[0] += 1;
+        push @{$seenAref->[1]}, $txNum;
+
+        $dbManager->dbPut($db, $peptide, $seenAref);
+      }
+    }
+
+    if(@uniquePeptides > 0) {
+      $rec->[2] = \@uniquePeptides;
+
+      push @finalRecords, $rec;
+    }
+  }
+
+  return @finalRecords;
+}
+
+sub storeUniquePeptides {
+  my ($rec, $txNum, $dbManager, $db);
+
+  for my $peptide (@${$rec->[2]}) {
+    $dbManager->dbPut($db, $peptide, [1, $txNum]);
+  }
+
+  return;
+}
+
+sub sortAndStoreUniquePeptides {
+  my ($recsAref, $txNum, $dbManager, $db);
+
+  my @finalRecords;
+
+  for my $rec (sort { @{$b->[2]} <=> @{$a->[2]} } @$recsAref) {
+    # Check each peptide against 
+    my @uniquePeptides;
+
+    for my $peptide (@${$rec->[2]}) {
+      my $seenAref = $dbManager->dbReadOne($db, $peptide, 1);
+
+      
+      if(!defined $seenAref) {
+        push @uniquePeptides, $peptide;
+
+        $seenAref = [ 1, [$txNum] ];
+      } else {
+        $seenAref->[0] += 1;
+        push @{$seenAref->[1]}, $txNum;
+      }
+
+      $dbManager->dbPut($db, $peptide, $seenAref);
+    }
+
+    if(@uniquePeptides > 0) {
+      $rec->[2] = \@uniquePeptides;
+
+      push @finalRecords, $rec;
+    }
+  }
+
+  return @finalRecords;
+}
+
+sub makeVarProtForTxFn {
+  my $config = shift;
+  
+  my $altAaIdx = $config->{altAaIdx};
+  my $refAaIdx = $config->{refAaIdx};
+  my $codonNumIdx = $config->{codonNumIdx};
+  my $cutsHref = $config->{cutsHref};
+  my $globalUniquePeptideFn = $config->{globalUniquePeptideFn};
+  my $maxPeptideLength = $config->{maxPeptideLength};
+
+  return sub {
+    my ($varTxAref, $refAaSeq) = @_;
+
+    p $varTxAref;
+    p $refAaSeq;
+    
+    my (@uniqueRecords, %seqWithUnique);
+
+    my $lastCodonNum;
+
+    if(!$refAaSeq->[-1] eq '*') {
+      say STDERR "Got a transcript without a trailing stop";
+      $seqWithUnique{-9} = [ @$refAaSeq ];
+    } else {
+      $seqWithUnique{-9} = [ @$refAaSeq[ 0 .. $#$refAaSeq - 1 ] ];
+    }
+
+    my $max = -9 + sum map { $_->[$codonNumIdx] } @$varTxAref;
+    # my $max = "-9" . join(" ", @$varTxAref);
+    say STDERR "max is $max";
+
+    for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
+      my $codonNum = $var->[$codonNumIdx];
+
+      # TODO: CHECK ON THIS: THOMAS HAS THIS INITIALIZED TO 1, WHICH I THINK
+      # MAY CAUSE SOME COMBINATIONS NOT TO BE SEEN (WHEN THE FIRST CODON)
+      # IS > maxPeptideLength away
+      $lastCodonNum //= $codonNum;
+
+      # We can avoid running this condition if we 
+      # Both of these are 1-based, so add 1 to be consistent with other 
+      # parts of the application, or more succinctly choose > instead of >=
+      if($codonNum - $lastCodonNum > $maxPeptideLength) {
+        last;
+      }
+
+      my $altAa = $var->[$altAaIdx];
+
+      # Save cycles
+      if(!$cutsHref->{$altAa}) {
+        next;
+      }
+
+      my $refAa = $var->[$refAaIdx];
+
+      if($refAa ne $seqWithUnique{-9}[$codonNum - 1]) {
+        die "NOT EQUAL at codon $codonNum of $seqWithUnique{-9}";
+      }
+
+      $lastCodonNum = $codonNum;
+      for my $i (keys %seqWithUnique) {
+        # Copy this mutated allele (or reference if first iteration)
+        # Mutate that 
+        my @newSeq = @{$seqWithUnique{$i}[1]};
+
+        # Thomas did this in the seq_of_per_prot, aka the seqWithUnique loop
+        # but that seems unnecessary, since we should by definition
+        # never have a replacement site at a stop codon
+        # and our stop codon should be at the end of the reference
+        # so to save time on if statements and indexing
+        # we should chomp the array
+        # if($newSeq[$codonNum - 1] eq '*') {
+        #   next;
+        # }
+
+        $newSeq[$codonNum - 1] = $altAa;
+  p @newSeq;
+        my @uniquePeptides = $globalUniquePeptideFn->(\@newSeq);
+
+        if(@uniquePeptides == 0) {
+          if($i != -9) {
+            # always keep the reference around
+            delete $seqWithUnique{$i};
+          }
+
+          next;
+        }
+
+        my $varRecAref;
+        
+        if($i == -9) {
+          $varRecAref = [$var];
+        } else {
+          $varRecAref = [@{$seqWithUnique{$i}[0]}, $var];
+        }
+
+        my $recAref = [$varRecAref, \@newSeq, \@uniquePeptides];
+
+        # We keep a reference to the unique peptides because this allows
+        # future steps that need to find the unique peptides conditioned
+        # on not being in the set of the previous most unique sequences' unique peptides
+        # which allows us to dramatically reduce our search space in that step
+        push @uniqueRecords, $recAref;
+
+        # The value of the key is only import in that we want to know
+        # whether we've made a record with all substitutions
+        $seqWithUnique{$i + $codonNum} = $recAref;
+      }
+    }
+
+    if(!$seqWithUnique{$max}) {
+      # Mutates the reference sequence copy we made, but we'll delete that
+      my $newSeq = $seqWithUnique{-9};
+
+      for my $var (@$varTxAref) {
+        $newSeq->[ $var->[$codonNumIdx] - 1] = $var->[$altAaIdx];
+      }
+
+      my @uniquePeptides = $globalUniquePeptideFn->($newSeq);
+
+      if(@uniquePeptides) {
+        push @uniqueRecords, [$varTxAref, $newSeq, \@uniquePeptides];
+      }
+    } else {
+      say "Have max";
+    }
+
+
+    delete $seqWithUnique{-9};
+
+    return \@uniqueRecords;
+  }
+}
+
+# sub trypsin {
+#   my $aaAref = shift;
+
+#   my @cutSites;
+#   my $lastCutSite = 0;
+
+#   my $i = -1;
+#   my $start;
+#   my $seq;
+#   my @peptides;
+#   for my $aa (@$aaAref) {
+#     $i++;
+
+#     if($aa eq '*') {
+#       last;
+#     }
+
+#     if($aa eq 'K' || $aa eq 'R') {
+#       push @cutSites, $i + 1;
+#       $lastCutSite = $i + 1;
+#     }
+#   }
+
+#   # if a K or R at the end, don't include it twice but also include the
+#   # end of the protein
+#   if( $lastCutSite < @$aaAref) {
+#     push @cutSites, scalar @$aaAref;
+#   }
+
+#   # reset
+#   $lastCutSite = 0;
+  
+#   $i = -1;
+#   for my $end (@cutSites) {
+#     $i++;
+
+#     # Don't add + 1 because we take lastCutSite .. $end - 1, so this is already +1 length
+#     # and because end in the above is $i + 1
+#     if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
+#       # No need to join into a string...that's a byte array anyway
+#       # Just keep the reference to an array reference
+#       push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+#     }
+
+#     if ( $end == @$aaAref ) {
+#       last;
+#     }
+
+#     # If the next base is a proline that blocks
+#     if( $aaAref->[$end] eq 'P' ) {
+#       # any more cut sites?
+#       if( $i + 1 < @cutSites) {
+#         $end = $cutSites[ $i + 1 ];
+
+#         if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
+#           # No need to join into a string...that's a byte array anyway
+#           # Just keep the reference to an array reference
+#           push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ] );
+#         }
+#       }
+#     }
+
+#     $lastCutSite = $end;
+#   }
+
+#   return @peptides;
+# }
 
 # Replicates:
 # 1) sub var_prot_for_tx, which:
@@ -1391,6 +1906,27 @@ sub makeDbWriter {
     }
   }
 }
+
+# sub _getWantedEntries {
+#    my @wanted = (
+#     'chr', 'pos', 'type', 'ref', 'alt',
+#     'exonicAlleleFunction', 'strand', 'codonNum', 'refCodon', 'altCodon', 'refAa', 'altAa',
+#     'name', 'name2', 'codonPos', 'txNumber', 'het'
+#   );
+
+#   my %wanted;
+#   for (my $i = 0; $i < @wanted; $i++) {
+#     $wanted{$wanted[$i]} = $i;
+#   }
+
+#   # These are never arrays
+#   my $chrIdx = $wanted{'chr'};
+#   my $posIdx = $wanted{'pos'};
+#   my $typeIdx = $wanted{'type'};
+#   my $refIdx = $wanted{'ref'};
+#   my $altIdx = $wanted{'alt'};
+#   my $hetIdx = $wanted{'het'};
+# }
 
 ################ Borrowed from Thomas, with minor modifications ################
 # Choose informativ

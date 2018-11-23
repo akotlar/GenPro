@@ -580,15 +580,8 @@ sub dbDelete {
 #cursor version
 # Read transactions are by default not committed
 sub dbReadAll {
-  my ( $self, $envName, $dbName, $skipCommit, $stringKeys ) = @_;
-
-  die "NOT IMPLEMENTED YET";
-  #==   $_[0], $_[1], $_[2]
-
-  #It is possible not to find a database in dbReadOnly mode (for ex: refSeq for a while didn't have chrM)
-  #http://ideone.com/uzpdZ8
-  my $db = $self->_getDbi( $envName, 0, $stringKeys, $dbName ) or return;
-
+  my ( $self, $db, $skipCommit ) = @_;
+  
   if ( !$db->{db}->Alive ) {
     $db->{db}->Txn = $db->{env}->BeginTxn();
 
