@@ -1,4 +1,6 @@
 # TODO: Put each database in a separate environemnet, aka folder
+# TODO: Check that we don't want stopGain, stopLoss, startGain, or spliceD/A
+
 # or at least put the meta information as a subfolder, say refProteins/meta
 
 use 5.10.0;
@@ -26,6 +28,7 @@ use lib './lib';
 use GenPro::DBManager;
 use GenPro::Digest;
 
+use Seq::Tracks::Base::MapFieldNames;
 use Seq::Tracks::Gene::Site;
 use Seq::Tracks::Gene::Site::CodonMap;
 use Seq::DBManager;
@@ -89,8 +92,19 @@ my $maxPeptideLength = 40;
 
 my $trim_end_regex     = qr{\*[\*\w]*\z};
 
-
 my @allDigestFuncs = ('trypsin');
+
+has refProtConfig => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1,
+default => sub {
+  my $self = shift;
+
+  return $self->sampleDbConfig;
+});
+
+# TODO: Move sample stuff into separate package
+# my $sampleFieldNamer = Seq::Tracks::Base::MapFieldNames->new({
+#   name => 'sampleVariant',
+# });
 
 has sampleDbConfig => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1,
 default => sub {
@@ -104,11 +118,61 @@ default => sub {
   }
 });
 
-has refProtConfig => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1,
-default => sub {
+has sampleTxTrack => (is => 'ro', isa => 'Str', default => 'refSeq');
+# TODO: set the feature names based on the tx track 
+has sampleFeatures => (is => 'ro', isa => 'ArrayRef', init_arg => undef, lazy => 1, default => sub {
+  my $self = shift;
+  my $track = $self->sampleTxTrack;
+  
+  my $locationFeatures = $self->sampleLocationFeatures;
+  my $geneTrackFeatures = $self->sampleGeneTrackFeatures;
+  my $computedFeatures = $self->sampleComputedFeatures;
+
+  # return ['chr', 'pos', 'type', 'ref', 'alt', 'isHet', "$track.txNumber", "$track.name", "$track.name2",
+  #         "$track.exonicAlleleFunction", "$track.strand", "$track.codonNumber", "$track.codonPosition",
+  #         "$track.refCodon", "$track.altCodon", "$track.refAminoAcid", "$track.altAminoAcid" ];
+  return [@$locationFeatures, @$computedFeatures, @$geneTrackFeatures];
+});
+
+has sampleLocationFeatures => (is => 'ro', isa => 'ArrayRef', lazy => 1, default => sub {
+  return ['chr', 'pos', 'type', 'ref', 'alt'];
+});
+
+has sampleComputedFeatures => (is => 'ro', isa => 'ArrayRef', lazy => 1, default => sub {
+  return ['isHet'];
+});
+
+# TODO: allow these to be use the gene track getter defaults
+has sampleGeneTrackFeatures => (is => 'ro', isa => 'ArrayRef', lazy => 1, default => sub {
+  return [
+    "txNumber", "name", "name2", "exonicAlleleFunction", "strand",
+    "codonNumber", "codonPosition", "refCodon", "altCodon", "refAminoAcid", "altAminoAcid"
+  ];
+});
+
+# A simpler version that doesn't rely on the meta table
+# Could use the getFieldDbName instead of the index
+has sampleFeatureDbIdx => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1, default => sub {
   my $self = shift;
 
-  return $self->sampleDbConfig;
+  my $trackName = $self->sampleTxTrack;
+
+  my %features;
+  
+  my $i = -1;
+  for my $feat (@{$self->sampleFeatures}) {
+    $i++;
+
+    $features{$feat} = $i;
+
+    my $parentIdx = index($feat, "$trackName.");
+
+    if($parentIdx > -1) {
+      $features{substr($feat, $parentIdx + 1)} = $i
+    }
+  }
+
+  return \%features;
 });
 
 # my $mp = Data::MessagePack->new()->prefer_integer()->prefer_float32();
@@ -116,6 +180,8 @@ default => sub {
 # TODO: further reduce complexity
 sub BUILD {
   my $self = shift;
+
+  $self->sampleFeatureDbIdx;
 
   if ( $self->maxDel > 0 ) {
     $self->setMaxDel( -$self->maxDel );
@@ -176,7 +242,7 @@ sub annotate {
   my ($sampleList, $wantedTxNums);
 
   # TODO: For efficiency sake, return the tx names (name field) as well
-  ( $err, $sampleList, $wantedTxNums ) = $self->makePersonalProtDb($fileType);
+  ( $err, $sampleList, $wantedTxNums ) = $self->sampleMakePersonalProtDb($fileType);
 
   say STDERR "FINISHED STEP 1 (make personal replacement db)";
 
@@ -184,7 +250,6 @@ sub annotate {
 
   say STDERR "FINISHED STEP 2 (make reference protein db for requested txNumbers)";
 
-  
   ( $err ) = $self->makeReferenceUniquePeptides($sampleList, $wantedTxNums);
   say STDERR "FINISHED STEP 3 (make reference peptide database for trypsin for requested txNumbers)";
   
@@ -203,7 +268,37 @@ sub annotate {
   return ( "File type isn\'t vcf or snp. Please use one of these files", undef );
 }
 
-sub makePersonalProtDb {
+sub _writeSampleCompleted {
+  my ($self, $completedHref, $recordedTxNumsHref) = @_;
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig);
+    $personalDb->dbPut($metaDb, $metaKeys{samplesWritten}, $completedHref );
+    $personalDb->dbPut($metaDb, $metaKeys{wantedTxs}, $recordedTxNumsHref );
+  undef $metaDb;
+
+  $personalDb->cleanUp();
+}
+
+sub _getSampleTodo {
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
+    my $c = $personalDb->dbReadOne( $metaDb, $metaKeys{samplesWritten} ) || {};
+    my $previousTxNums = $personalDb->dbReadOne( $metaDb, $metaKeys{wantedTxs} ) || {};
+
+  # Need to clean up after ourselves
+  # Otherwise we'll have a dangling reference to a free'd environment in LMDB
+  undef $metaDb;
+
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+
+  return ($c, $previousTxNums);
+}
+
+sub sampleMakePersonalProtDb {
 
   #Inspired by T.S Wingo: https://github.com/wingolab-org/GenPro/blob/master/bin/vcfToSnp
   my $self = shift;
@@ -212,7 +307,7 @@ sub makePersonalProtDb {
   # This replicates sub ProcessIds {
   # which just returns an array of ids
   my ( $err, $fh, $outFh, $statsFh, $sampleListAref ) =
-  $self->_getFileHandlesAndSampleList($type);
+  $self->_sampleGetFileHandlesAndSampleList($type);
 
   if ($err) {
     $self->_errorWithCleanup($err);
@@ -227,56 +322,103 @@ sub makePersonalProtDb {
     return ( $err, undef );
   }
 
-  my $personalDb = GenPro::DBManager->new();
+  my ($completedHref, $recordedTxNumsHref) = $self->_getSampleTodo();
 
-  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
-    my $c = $personalDb->dbReadOne( $metaDb, $metaKeys{samplesWritten} );
-    my $previousTxNums = $personalDb->dbReadOne( $metaDb, $metaKeys{wantedTxs} );
-
-  # Need to clean up after ourselves
-  # Otherwise we'll have a dangling reference to a free'd environment in LMDB
-  undef $metaDb;
-
-  # Create the databases, 1 database per sample,
-  # and each sample database was 25 tables, 1 per chromosome
-  
-  my %completed = $c ? %$c : ();
-  my %wantedTxNumbers = $previousTxNums ? %$previousTxNums : ();
-
-  if ( keys %completed == @$sampleListAref ) {
-    return ( undef, \%completed, \%wantedTxNumbers);
+  if ( keys %$completedHref == @$sampleListAref ) {
+    return ( undef, $completedHref, $recordedTxNumsHref);
   }
-
-  # # Ensure that the database is opened
-  my $nChr = @{ $self->chromosomes };
-
-  # It *SEEMS* I don't have to pre-make the databases....
-  # TODO: Write test for this...
-  # for my $sample (@$sampleListAref) {
-  #   if ( $completed{$sample} ) {
-  #     next;
-  #   }
-
-  #   for my $chr ( @{ $self->chromosomes } ) {
-  #     $personalDb->_getDbi( $sample, 0, 0, $chr, $nChr );
-  #   }
-  # }
-  
-  # Clear the singleton instance, ensure that threads don't copy any memory
-  $personalDb->cleanUp();
-  undef $personalDb;
-
-  ######################## Build the fork pool #################################
-
-  # Report every 1e4 lines, to avoid thrashing receiver
-  my $progressFunc = $self->makeDbWriter( \%completed, \%wantedTxNumbers );
 
   ########################## Write the header ##################################
   my $header = <$fh>;
   $self->setLineEndings($header);
 
   # Register the output of the intermediate fileProcessor output with GenPro
-  my $finalHeader = $self->_setFinalHeader($header);
+  my $headers = $self->_setFinalHeader($header);
+
+  # We separate out the reference track getter so that we can check for discordant
+  # bases, and pass the true reference base to other getters that may want it (like CADD)
+
+  # To avoid the Moose/Mouse accessor penalty, store reference to underlying data
+
+  my $refTrackGetter = $self->tracksObj->getRefTrackGetter();
+
+  my $geneTrackName = $self->sampleTxTrack;
+  # TODO: specify the refSeq track name in the YAML config
+  # A property on the GenPro track
+  my $geneTrackGetter = $self->tracksObj->getTrackGetterByName($geneTrackName);
+
+  if(!$geneTrackGetter) {
+    die "Unrecognized track " . $self->sampleTxTrack;
+  }
+
+  # Todo: get from own class configuration
+  my %wantedChromosomes = %{ $refTrackGetter->chromosomes };
+  my $maxDel            = $self->maxDel;
+
+  my $replacement = $geneTrackGetter->siteTypes->{replacement};
+
+  # TODO: make this less clumsy
+  my $geneDef = Seq::Tracks::Gene::Definition->new();
+
+  my $txErrorInIdx = $headers->getFeatureIdx($geneTrackName, $geneDef->txErrorName);
+  my $exonicAlleleFuncInIdx = $headers->getFeatureIdx($geneTrackName, $geneTrackGetter->exonicAlleleFunctionKey);
+  my $hetInIdx = $headers->getFeatureIdx(undef, 'heterozygotes');
+  my $homInIdx = $headers->getFeatureIdx(undef, 'homozygotes');
+
+  if ( !( defined $homInIdx && defined $hetInIdx && defined $exonicAlleleFuncInIdx ) ) {
+    my $err = "Require 'heterozygotes' and 'homozygotes' and "
+      . $geneTrackGetter->exonicAlleleFunctionKey . " output for $type fileProcessor";
+
+    $self->_errorWithCleanup($err);
+    die $err;
+    return ( $err, undef );
+  }
+
+  my %sampleFeatureDbIdx = %{$self->sampleFeatureDbIdx};
+
+  my @geneIdx;
+  for my $feat (@{$self->sampleGeneTrackFeatures}) {
+    my $inIdx = $headers->getFeatureIdx($geneTrackName, $feat);
+    my $outIdx = $sampleFeatureDbIdx{$feat};
+
+    if(!defined $outIdx) {
+      die "Expected feat $feat to be in the header: " . $headers->getString();
+    }
+
+    push @geneIdx, [$inIdx, $outIdx];
+  }
+
+  my $chrIdx = $sampleFeatureDbIdx{chr};
+  my $posIdx = $sampleFeatureDbIdx{pos};
+  my $typeIdx = $sampleFeatureDbIdx{type};
+  my $refIdx =  $sampleFeatureDbIdx{ref};
+  my $altIdx = $sampleFeatureDbIdx{alt};
+
+  # TODO: We don't actually require the names of these to be fixed
+  # but maybe we should
+  # order is however fixed, so we could use 0 - 4 here instead
+  my $chrInIdx  = $headers->getFeatureIdx(undef, 'chrom');
+  my $posInIdx  = $headers->getFeatureIdx(undef, 'pos');
+  my $typeInIdx = $headers->getFeatureIdx(undef, 'type');
+  # We overwrite the reference with 'discordant'; 
+  # So in the header the supplied reference field is replaced with 'discordant';
+  my $refInIdx  = $headers->getFeatureIdx(undef, 'discordant');
+  my $altInIdx  = $headers->getFeatureIdx(undef, 'alt');
+# say STDERR "ref index $refInIdx";
+# die "BLAH";
+  my $txNumberIdx = $sampleFeatureDbIdx{txNumber};
+  
+  my $isHetIdx = $sampleFeatureDbIdx{isHet};
+
+  my $db = $self->{_db};
+
+  my $sConfig = $self->sampleDbConfig;
+  my $nSampleFeatures = @{ $self->sampleFeatures };
+
+  ######################## Build the fork pool #################################
+
+  # Report every 1e4 lines, to avoid thrashing receiver
+  my $progressFunc = $self->makeDbWriter( $completedHref, $recordedTxNumsHref );
 
   MCE::Loop::init {
     max_workers => $self->maxThreads || 8,
@@ -288,83 +430,6 @@ sub makePersonalProtDb {
     gather     => $progressFunc,
   };
 
-  # We separate out the reference track getter so that we can check for discordant
-  # bases, and pass the true reference base to other getters that may want it (like CADD)
-
-  # To avoid the Moose/Mouse accessor penalty, store reference to underlying data
-
-  my $refTrackGetter = $self->tracksObj->getRefTrackGetter();
-
-  # TODO: specify the refSeq track name in the YAML config
-  # A property on the GenPro track
-  my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
-
-  my %wantedChromosomes = %{ $refTrackGetter->chromosomes };
-  my $maxDel            = $self->maxDel;
-
-  #Accessors are amazingly slow; it takes as long to call ->name as track->get
-  #after accounting for the nubmer of calls to ->name
-  # my @trackNames = map { $_->name } @{$self->_tracks};
-
-  # TODO: don't annotate MT (GRCh37) if MT not explicitly specified
-  # to avoid issues between GRCh37 and hg19 chrM vs MT
-  # my %normalizedNames = %{$self->normalizedWantedChrs};
-
-  # TODO: Grab it from the intermediate output header ($header) and complain if not found
-  my $headers = Seq::Headers->new();
-
-  # my $headerIndices = $headers->getParentIndices();
-
-  my $hetIdx = $finalHeader->getFeatureIdx(undef, 'heterozygotes');
-  my $homIdx = $finalHeader->getFeatureIdx(undef, 'homozygotes');
-
-  if ( !( defined $homIdx && defined $hetIdx ) ) {
-    my $err = "Require 'heterozygotes' and 'homozygotes' output for $type fileProcessor";
-    $self->_errorWithCleanup($err);
-    die $err;
-    return ( $err, undef );
-  }
-
-  my $replacement = $geneTrackGetter->siteTypes->{replacement};
-
-  # TODO: Get all these by reading the header, not by using the private
-  # interface
-
-  # from the db raw input src (ucsc records)
-  my ( $nameIdx, $name2Idx, $txErrorIdx);
-
-  # computed features
-  my ($exonicAlleleFuncIdx,  $codonNumIdx , $refCodonIdx, $strandIdx,
-    $altCodonIdx , $refAaIdx, $altAaIdx, $codonPosIdx, $txNumberIdx);
-
-  my $trackName = $geneTrackGetter->name;
-
-  $strandIdx = $headers->getFeatureIdx($trackName, 'strand');
-  $nameIdx = $headers->getFeatureIdx($trackName, 'name');
-  $name2Idx = $headers->getFeatureIdx($trackName, 'name2');
-  $txErrorIdx = $headers->getFeatureIdx($trackName, 'txError');
-
-  $exonicAlleleFuncIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->exonicAlleleFunctionKey);
-  $codonNumIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->codonNumberKey);
-  $codonPosIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->codonPositionKey);
-  $refCodonIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->codonSequenceKey);
-  $altCodonIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->newCodonKey);
-  $refAaIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->refAminoAcidKey);
-  $altAaIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->newAminoAcidKey);
-  $txNumberIdx = $headers->getFeatureIdx($trackName, $geneTrackGetter->txNumberKey);
-
-  # Defines feature insertion order
-  # This defines what our per-user record looks like at any given position
-  # Except we add 5 fields to beginning (chr, pos, type, ref, alt)
-  # And 1 field to end (het/hom status
-  my @wanted = (
-    $exonicAlleleFuncIdx, $strandIdx, $codonNumIdx, $refCodonIdx, $altCodonIdx, $refAaIdx, $altAaIdx,
-    $nameIdx, $name2Idx, $codonPosIdx, $txNumberIdx
-  );
-
-  my $db = $self->{_db};
-
-  my %sConfig = %{$self->sampleDbConfig};
   mce_loop_f {
 
     my ( $mce, $slurp_ref, $chunk_id ) = @_;
@@ -376,23 +441,16 @@ sub makePersonalProtDb {
 
     my $total = 0;
 
-    my $dataFromDbAref;
-    my $zeroPos;
-    my $chr;
-    my @fields;
+    my ($dataFromDbAref, $zeroPos, $chr, @fields);
 
-    #my @results;
-    my %seen;
-    my %cursors  = ();
-    my %pCursors = ();
+    my (%cursors, %dbs);
 
-    my %txNumbers;
-    my %dbs;
+    my (%seen, %txNumbers);
 
     # since we cleared db singleton using cleanUp, we now have a new instance
     # local to this thread
-    $personalDb  =  GenPro::DBManager->new();
-   
+    my $personalDb  =  GenPro::DBManager->new();
+
     ####### Read #######
     # The ouptut of the intermediate fileProcessor is expected to be
     # chrom \t pos \t type \t inputRef \t alt \t hets \t heterozygosity \t homs ...
@@ -410,8 +468,8 @@ sub makePersonalProtDb {
         next;
       }
 
-      $chr     = $fields[0];
-      $zeroPos = $fields[1] - 1;
+      $chr     = $fields[$chrInIdx];
+      $zeroPos = $fields[$posInIdx] - 1;
 
       # Caveat: It seems that, per database ($chr), we can have only one
       # read-only transaction; so ... yeah can't combine with dbRead, dbReadOne
@@ -422,16 +480,16 @@ sub makePersonalProtDb {
       $dataFromDbAref = $db->dbReadOneCursorUnsafe( $cursors{$chr}, $zeroPos );
 
       if ( !defined $dataFromDbAref ) {
-        $self->_errorWithCleanup("Wrong assembly? $chr\: $fields[1] not found.");
+        $self->_errorWithCleanup("Wrong assembly? $chr\: $fields[$posInIdx] not found.");
 
         # Store a reference to the error, allowing us to exit with a useful fail message
-        MCE->gather( 0, 0, "Wrong assembly? $chr\: $fields[1] not found." );
+        MCE->gather( 0, 0, "Wrong assembly? $chr\: $fields[$posInIdx] not found." );
         $_[0]->abort();
         return;
       }
 
       # For now we don't handle indesl
-      if ( length( $fields[4] ) > 1 ) {
+      if ( length( $fields[$altInIdx] ) > 1 ) {
         next;
       }
 
@@ -441,15 +499,15 @@ sub makePersonalProtDb {
       $geneTrackGetter->get(
         $dataFromDbAref,
         $chr,          # chr
-        $fields[3],    #ref
-        $fields[4],    #alt
+        $fields[$refInIdx],    #ref
+        $fields[$altInIdx],    #alt
         0,
         \@out,
         $zeroPos
       );
 
-      if ( $refTrackGetter->get($dataFromDbAref) ne $fields[3] ) {
-        $self->log( 'info', "Discordant: $chr: $fields[1]" );
+      if ( $refTrackGetter->get($dataFromDbAref) ne $fields[$refInIdx] ) {
+        $self->log( 'info', "Discordant: $chr: $fields[$posInIdx]" );
         next;
       }
 
@@ -463,18 +521,16 @@ sub makePersonalProtDb {
       # All features retain order relative to the transcript,
       # even features that have a 1 tx : M subfeatures (like spDisplayID) mapping
       # So all we need is the indices of the exonicAlleleFunction that are replacement
-      my $func = $out[$exonicAlleleFuncIdx][0];
+      my $func = $out[$exonicAlleleFuncInIdx][0];
 
       if ( !defined $func ) {
         next;
       }
 
-      # Check that we don't want stopGain, stopLoss, startGain, or spliceD/A
-
       my @ok;
       if ( !ref $func ) {
         # When scalar $out[$txErrorIdx][0] will be an array of errors, or undefined
-        if( $func ne $replacement || defined $out[$txErrorIdx][0]) {
+        if( $func ne $replacement || defined $out[$txErrorInIdx][0]) {
           next;
         }
       } else {
@@ -487,7 +543,7 @@ sub makePersonalProtDb {
           if (
             defined $func->[$idx] &&
             $func->[$idx] eq $replacement &&
-            !defined $out[$txErrorIdx][0][$idx]
+            !defined $out[$txErrorInIdx][0][$idx]
           ) {
             push @ok, $idx;
             $found ||= 1;
@@ -499,105 +555,78 @@ sub makePersonalProtDb {
         }
       }
 
-      ################### What we aim to write ########################
-      # TODO: Can optimize away insertion of exonicAlleleFunction is only
-      # interested in replacement sites
-      # We're going to do this as an array, following @wanted, defined above
-      # my $record_href = {
-      #   aa_residue => $aa_residue,
-      #   old_aa     => $codon_2_aa{$codon},
-      #   new_aa     => $codon_2_aa{$new_codon},
-      #   chr        => $chr,
-      #   chr_pos    => $pos,
-      #   codon_pos  => $codon_pos,
-      #   ref_allele => $ref_allele,
-      #   min_allele => $min_allele,
-      # };
-
       # TODO: Optimize allocations
       # flexible features (such as description, not necessary for the Gene class)
       my @record;
 
       # First 5 records are chr, pos, type, ref, alt; last record is whether it's a het or a hom
-      $#record = $#wanted + 6;
+      $#record = $nSampleFeatures - 1;
 
-      $record[0] = $fields[0];    #chr
-      $record[1] = $fields[1];    #pos
-      $record[2] = $fields[2];    #type (SNP, INS, DEL, etc), could remove
-      $record[3] = $fields[3];    #ref
-      $record[4] = $fields[4];    #alt
+      # TODO: Use the index from the intermediate output
+      $record[$chrIdx]  = $fields[0];    #chr
+      $record[$posIdx]  = $fields[1];    #pos
+      $record[$typeIdx] = $fields[2];    #type (SNP, INS, DEL, etc), could remove
+      $record[$refIdx]  = $fields[3];    #ref
+      $record[$altIdx]  = $fields[4];    #alt
 
       # could be more elegant
       # build up the array of results
       if ( @ok == 0 ) {
-        my $outIdx = 5;
-        for my $fIdx (@wanted) {
+        for my $fIdx (@geneIdx) {
           # 0 because non-indels have only 1 position index
-          $record[$outIdx] = $out[$fIdx][0];
-          $outIdx++;
+          $record[$fIdx->[1]] = $out[ $fIdx->[0] ][0];
         }
       } elsif ( @ok == 1 ) {
         my $txIdx  = $ok[0];
-        my $outIdx = 5;
-
-        for my $fIdx (@wanted) {
+        
+        for my $fIdx (@geneIdx) {
           # 0 because non-indels have only 1 position index
-          $record[$outIdx] = $out[$fIdx][0][$txIdx];
-          $outIdx++;
+          $record[$fIdx->[1]] = $out[ $fIdx->[0] ][0][$txIdx];
         }
       } else {
         my $seenFirst;
 
         for my $txIdx (@ok) {
-
           if ( !$seenFirst ) {
-            my $outIdx = 5;
-            for my $fIdx (@wanted) {
+            for my $fIdx (@geneIdx) {
               # 0 because non-indels have only 1 position index
-              $record[$outIdx] = [ $out[$fIdx][0][$txIdx] ];
-              $outIdx++;
+              $record[$fIdx->[1]] = [ $out[ $fIdx->[0] ][0][$txIdx] ];
             }
 
             $seenFirst = 1;
             next;
           }
 
-          my $outIdx = 5;
-          for my $fIdx (@wanted) {
+          for my $fIdx (@geneIdx) {
             # 0 because non-indels have only 1 position index
-            push @{ $record[$outIdx] }, $out[$fIdx][0][$txIdx];
-            $outIdx++;
+            push @{ $record[$fIdx->[1]] }, $out[ $fIdx->[0] ][0][$txIdx];
           }
         }
       }
 
       # Todo use the configured delimiters from Seq::Ouput->delimiters
       my %hets;
-      if ( $fields[$hetIdx] ne '!' ) {
-        %hets = map { $_ => 1 } split( ';', $fields[$hetIdx] );
+      if ( $fields[$hetInIdx] ne '!' ) {
+        %hets = map { $_ => 1 } split( ';', $fields[$hetInIdx] );
       }
 
       my %homs;
-      if ( $fields[$homIdx] ne '!' ) {
-        %homs = map { $_ => 1 } split( ';', $fields[$homIdx] );
+      if ( $fields[$homInIdx] ne '!' ) {
+        %homs = map { $_ => 1 } split( ';', $fields[$homInIdx] );
       }
 
       my $cnt = 0;
+
       # Can no longer use keys % in scalar context
-      # This seems to work
       my $max = %hets + %homs;
 
-      my $sIdx;
-      my @samples;
       my $het = 1;
 
       $txNumbers{$chr} //= {};
-      my @nums = ref $record[-2] ? @{$record[-2]} : $record[-2];
+      my @nums = ref $record[$txNumberIdx] ? @{$record[$txNumberIdx]} : $record[$txNumberIdx];
       for my $num (@nums) {
         $txNumbers{$chr}{$num} //= 1;
       }
-
-      # my @wantedSamples = 
 
       # Optimize, only read over hets + homs
       for my $sample (@$sampleListAref) {
@@ -608,9 +637,9 @@ sub makePersonalProtDb {
 
         # Store whether het or not
         if ( $hets{$sample} ) {
-          $record[-1] = 1;
+          $record[$isHetIdx] = 1;
         } elsif ( $homs{$sample} ) {
-          $record[-1] = 0;
+          $record[$isHetIdx] = 0;
         } else {
           next;
         }
@@ -618,23 +647,13 @@ sub makePersonalProtDb {
         $seen{$sample} //= 1;
 
         $cnt++;
-        # Doesn't work yet
-        #my (  $cursor, $chr, $trackKey, $pos, $newValue, $mergeFunc) = @_;
-        # $personalDb->dbPatchCursorUnsafe( $pCursors{$sample}{$chr},
-        #   $chr, 0, $zeroPos, \@record );
-
+  
         # dbPatch with per-op commit seems to work fine
 
-        # Here 0 is the index of the "Genpro" database
-        # This is of course not really necessary, it's just what Bystro does
-        # If we ended up adding a GenPro track to Bystro, this could be the
-        # sample index
-        # TODO: Use cursor; don't add unnecessary track key, add merge function
-        # in case of multiallelics
         if(!$dbs{$sample}) {
-          $dbs{$sample} = { $chr => $personalDb->_getDbi( $sample, $chr, \%sConfig ) };
+          $dbs{$sample} = { $chr => $personalDb->_getDbi( $sample, $chr, $sConfig ) };
         } elsif(!$dbs{$sample}{$chr}) {
-          $dbs{$sample}{$chr} = $personalDb->_getDbi( $sample, $chr, \%sConfig );
+          $dbs{$sample}{$chr} = $personalDb->_getDbi( $sample, $chr, $sConfig );
         }
 
         # We don't currently support multiallelics
@@ -644,31 +663,21 @@ sub makePersonalProtDb {
 
     MCE->gather( \%seen, \%txNumbers );
 
-    # Get in a good habit; need to free environment pointers for 
-    # LMDBB to clean up properly
-    # undef %dbs;
-    # $personalDb->cleanUp();
+    # If we issue personalDb->cleanUp() here, for some reason
+    # we can eventually get an 22 EINVAL error
+    # maybe too many concurrent openings, or a race condition
 
     close $MEM_FH;
   }
   $fh;
 
-  # Force flush of output
-  # $progressFunc->(undef);
-
   MCE::Loop::finish();
 
-  $personalDb = GenPro::DBManager->new();
-
-  $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig);
-    $personalDb->dbPut($metaDb, $metaKeys{samplesWritten}, \%completed );
-    $personalDb->dbPut($metaDb, $metaKeys{wantedTxs}, \%wantedTxNumbers );
-  undef $metaDb;
+  $self->_writeSampleCompleted($completedHref, $recordedTxNumsHref);
 
   $db->cleanUp();
-  $personalDb->cleanUp();
 
-  return ( $err, \%completed, \%wantedTxNumbers );
+  return ( $err, $completedHref, $recordedTxNumsHref );
 }
 
 # Generates everything that GenPro_make_refprotdb does
@@ -1076,7 +1085,7 @@ sub makeReferenceUniquePeptides {
         $dbs{$enzyme} //= $personalDb->_getDbi( $refPeptideEnv, $enzyme, $refPeptideConfig );
         $dbi = $dbs{$enzyme}{dbi};
 
-        for my $peptide (trypsin($aaSeqAref)) {
+        for my $peptide ($digestFuncs{$enzyme}->($aaSeqAref)) {
           # say STDERR $peptide . "\n";
           my $txn = $dbs{$enzyme}{env}->BeginTxn();
 
@@ -1141,8 +1150,6 @@ sub makeSampleUniquePeptides {
 
   $wantedEnzymesAref //= ['trypsin'];
 
-  
-
   # When working with named databases, need to pass same configuration each time
   # This is to know the maxDbs config for the reference peptide database
   # which stores n peptides ('for now just trypsin');
@@ -1176,47 +1183,9 @@ sub makeSampleUniquePeptides {
     return;
   }
 
-  # When working with named databases, need to pass same configuration each time
-  # This is to know the maxDbs config for the reference protein database
-  # and maybe needs to be at least no less than the largest number it was last
-  # opened with (or maybe needs to be constant)
-  # TODO: Make this a configuration owned by the reference protein database
-  my $nChrs = @{$self->chromosomes};
+  my $txNumberIdx = $self->sampleFeatureDbIdx->{txNumber};
 
-  my @wanted = (
-    'chr', 'pos', 'type', 'ref', 'alt',
-    'exonicAlleleFunction', 'strand', 'codonNum', 'refCodon', 'altCodon', 'refAa', 'altAa',
-    'name', 'name2', 'codonPos', 'txNumber', 'het'
-  );
-
-  my %wanted;
-  for (my $i = 0; $i < @wanted; $i++) {
-    $wanted{$wanted[$i]} = $i;
-  }
-
-  # TODO: add other enzymes
-  my $digest = GenPro::Digest->new();
-  my $digestFunc = $digest->makeDigestFunc('trypsin');
-  my $cutsHref = $digest->digestLookups->{'trypsin'}{'cut'};
-
-  if(!$digestFunc) {
-    die 'No digest func for trypsin';
-  }
-
-  my $txNumberIdx = $wanted{'txNumber'};
-  my $altAaIdx = $wanted{'altAa'};
-  my $refAaIdx = $wanted{'refAa'};
-  my $codonNumIdx = $wanted{'codonNum'};
-  
-  my %txHasUniqueConfigTemplate = (
-    altAaIdx => $altAaIdx,
-    refAaIdx => $refAaIdx,
-    codonNumIdx => $codonNumIdx,
-    cutsHref => $cutsHref,
-    maxPeptideLength => $digest->maxPeptideLength,
-  );
-  
-   my $progressFunc = sub {
+  my $progressFunc = sub {
     my $seenSamples = shift;
 
     for my $sample (keys %$seenSamples) {
@@ -1235,7 +1204,6 @@ sub makeSampleUniquePeptides {
     gather     => $progressFunc,
   };
 
-  
   my @wantedChrs = keys %$wantedTxNumHref;
   mce_loop {
     my ($mce, $chunk_ref, $chunk_id) = @_;
@@ -1243,46 +1211,19 @@ sub makeSampleUniquePeptides {
     # Thread-local instance
     $personalDb = GenPro::DBManager->new();
 
-    my $existing;
-    my @peptides;
-    my %seenSamples;
+    # my %seenSamples;
 
-    my %refPeptideRdOnlyConfig = (%$refPeptideConfig, (readOnly => 1));
     my %refProtRdOnlyConfig = (%{$self->refProtConfig}, (readOnly => 1));
     my %sampleReadOnlyConfig = (%{$self->sampleDbConfig}, (readOnly => 1));
-
-    my $refPeptideDb = $personalDb->_getDbi( $refPeptideEnv, 'trypsin', \%refPeptideRdOnlyConfig );
-    my $refPeptideDbi = $refPeptideDb->{dbi};
-    my $refPeptideTxn = $refPeptideDb->{env}->BeginTxn();
-
     my %refProteinDbs;
-
-    my $globalUniquePeptideFn = sub {
-      my $aaAref = shift;
-
-      my @unique;
-      for my $peptide (trypsin($aaAref)) {
-        # say STDERR "PEPTIDE: $peptide";
-        if(!defined $personalDb->dbReadOneRaw($refPeptideTxn, $refPeptideDbi, $peptide)) {
-          # say STDERR "NOT DEFINED $peptide";
-          push @unique, $peptide;
-        }
-      }
-
-      return @unique;
-    };
-
-    my %txHasUniqueConfig = (%txHasUniqueConfigTemplate, (globalUniquePeptideFn => $globalUniquePeptideFn));
-    my $txHasUniquePeptidesFn = makeVarProtForTxFn(\%txHasUniqueConfig);
-
-    # p %txHasUniqueConfig;
+    
+    my ($txHasUniquePeptidesFn, $cleanUp) = $self->_sampleConfigureVarProtFn();
 
     for my $sample (@{ $chunk_ref }) {
       my @finalRecords;
 
       my $samplePeptideDb = $personalDb->_getDbi( "$sample/peptide", undef, $refPeptideConfig );
-
-      # TODO: take chromosomes from those written
+      
       for my $chr (@wantedChrs) {
         $refProteinDbs{$chr} //= $personalDb->_getDbi( $refProtEnv, $chr, \%refProtRdOnlyConfig );
 
@@ -1332,8 +1273,10 @@ sub makeSampleUniquePeptides {
           # \@{all affected txs}, \@{alt aa sequence}, \@uniquePeptides
           # where uniquePeptides is also modified by sortByUniquePeptides 
           my @sortedRecs = sortUniquePeptides($uniquePeptidesAref, $txNum, $personalDb, $samplePeptideDb);
-# p @sortedRecs;
-# sleep(1);
+
+          # p @sortedRecs;
+          # sleep(1);
+
           while(@sortedRecs) {
             my $rec = shift @sortedRecs;
             push @finalRecords, $rec;
@@ -1362,6 +1305,8 @@ sub makeSampleUniquePeptides {
       }
     }
 
+    $cleanUp->();
+
   } @toGetSamples;
 
   MCE::Loop::finish();
@@ -1373,6 +1318,66 @@ sub makeSampleUniquePeptides {
   # undef $metaDb;
 
   $personalDb->cleanUp();
+}
+
+sub _sampleConfigureVarProtFn {
+  # TODO: Get this from the sample variant meta database
+  my $self = shift;
+
+  my $features = $self->sampleFeatureDbIdx;
+
+  my $altAaIdx = $features->{altAminoAcid};
+  my $refAaIdx = $features->{refAminoAcid};
+  my $codonNumIdx = $features->{codonNumber};
+
+  my $dbManager = GenPro::DBManager->new();
+
+  my %refPeptideRdOnlyConfig = (%$refPeptideConfig, (readOnly => 1));
+  my $refPeptideDb = $dbManager->_getDbi( $refPeptideEnv, 'trypsin', \%refPeptideRdOnlyConfig );
+  my $refPeptideDbi = $refPeptideDb->{dbi};
+  my $refPeptideTxn = $refPeptideDb->{env}->BeginTxn();
+
+  # TODO: add other enzymes
+  my $digest = GenPro::Digest->new();
+  my $digestFunc = $digest->makeDigestFunc('trypsin');
+  my $cutsHref = $digest->digestLookups->{trypsin}{cut};
+
+  if(!$digestFunc) {
+    die 'No digest func for trypsin';
+  }
+
+  my $globalUniquePeptideFn = sub {
+    my $aaAref = shift;
+
+    my @unique;
+    for my $peptide ($digestFunc->($aaAref)) {
+      # say STDERR "PEPTIDE: $peptide";
+      if(!defined $dbManager->dbReadOneRaw($refPeptideTxn, $refPeptideDbi, $peptide)) {
+        # say STDERR "NOT DEFINED $peptide";
+        push @unique, $peptide;
+      }
+    }
+
+    return @unique;
+  };
+  
+
+  my %txHasUniqueConfig= (
+    altAaIdx => $altAaIdx,
+    refAaIdx => $refAaIdx,
+    codonNumIdx => $codonNumIdx,
+    cutsHref => $cutsHref,
+    maxPeptideLength => $digest->maxPeptideLength,
+    globalUniquePeptideFn => $globalUniquePeptideFn
+  );
+
+  my $txHasUniquePeptidesFn = makeVarProtForTxFn(\%txHasUniqueConfig);
+
+  my $cleanUp = sub {
+    $refPeptideTxn->abort();
+  };
+
+  return ($txHasUniquePeptidesFn, $cleanUp);
 }
 
 # Takes a variant record, with N affected transcripts,
@@ -1759,13 +1764,13 @@ sub makeDbWriter {
 
 ################################################################################
 
-sub _getFileHandles {
+sub _sampleGetFileHandles {
   my ( $self, $type ) = @_;
 
   my ( $outFh, $statsFh, $inFh );
   my $err;
 
-  ( $err, $inFh ) = $self->_openAnnotationPipe($type);
+  ( $err, $inFh ) = $self->_sampleOpenAnnotationPipe($type);
 
   if ($err) {
     return ( $err, undef, undef, undef );
@@ -1798,10 +1803,10 @@ sub _getFileHandles {
 # Regardless of how many lines of the output we read;
 # The sample list will get generated, if requested,
 # Even without reading from the stdout filehandle
-sub _getFileHandlesAndSampleList {
+sub _sampleGetFileHandlesAndSampleList {
   my ( $self, $type ) = @_;
 
-  my ( $err, $fh, $outFh, $statsFh ) = $self->_getFileHandles($type);
+  my ( $err, $fh, $outFh, $statsFh ) = $self->_sampleGetFileHandles($type);
 
   if ($err) {
     return ( $err, undef );
@@ -1826,14 +1831,14 @@ sub _getFileHandlesAndSampleList {
   return ( undef, $fh, $outFh, $statsFh, \@samples );
 }
 
-sub _openAnnotationPipe {
+sub _sampleOpenAnnotationPipe {
   my ( $self, $type ) = @_;
 
-  my ( $errPath, $inPath, $echoProg ) = $self->_getFileInfo();
+  my ( $errPath, $inPath, $echoProg ) = $self->_sampleGetFileInfo();
 
   my $fh;
 
-  my $args = $self->_getFileProcessor($type);
+  my $args = $self->_sampleGetFileProcessor($type);
 
   # TODO:  add support for GQ filtering in vcf
   my $err = $self->safeOpen( $fh, '-|', "$echoProg $inPath | $args 2> $errPath" );
@@ -1841,7 +1846,7 @@ sub _openAnnotationPipe {
   return ( $err, $fh );
 }
 
-sub _getFileInfo {
+sub _sampleGetFileInfo {
   my $self = shift;
 
   my $errPath =
@@ -1856,7 +1861,7 @@ sub _getFileInfo {
   return ( $errPath, $inPath, $echoProg );
 }
 
-sub _getFileProcessor {
+sub _sampleGetFileProcessor {
   my ( $self, $type ) = @_;
 
   if ( !$self->fileProcessors->{$type} ) {
@@ -1900,6 +1905,7 @@ sub _setFinalHeader {
   # indices:
   # idx 0: chromosome,
   # idx 1: position
+  # idx 2: type
   # idx 3: the reference (we rename this to discordant)
   # idx 4: the alternate allele
 

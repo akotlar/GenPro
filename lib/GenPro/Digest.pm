@@ -105,9 +105,6 @@ use DDP;
       # and because end in the above is $i + 1
       if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
         push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
-
-        say STDERR "peptides";
-        p @peptides;
       }
 
       if ( $end == @$aaAref ) {
@@ -122,9 +119,6 @@ use DDP;
 
           if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
             push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
-
-            say STDERR "peptides";
-            p @peptides;
           }
         }
       }
@@ -132,10 +126,7 @@ use DDP;
       $lastCutSite = $end;
     }
 
-    say STDERR "Got peptides";
-    p @peptides;
-
-    return \@peptides;
+    return @peptides;
   }
 
   # return $digestFuncs{$type};
