@@ -7,6 +7,7 @@ package GenPro::Digest;
 use Mouse 2;
 use namespace::autoclean;
 use Carp qw/croak/;
+# use DDP;
 
 has minPeptideLength => (is => 'ro', isa => 'Int', default => 6);
 has maxPeptideLength => (is => 'ro', isa => 'Int', default => 40);
@@ -42,8 +43,8 @@ sub makeDigestFunc {
   my $minPeptideLength = $self->minPeptideLength;
   my $maxPeptideLength = $self->maxPeptideLength;
 
-  my %cuts = $digestLookups{$type}{cut};
-  my %blocks = $digestLookups{$type}{block};
+  my %cuts = %{$digestLookups{$type}{cut}};
+  my %blocks = %{$digestLookups{$type}{block}};
 
   if(!(%cuts && %blocks)) {
     croak "We don't know how to digest $type";
@@ -59,10 +60,10 @@ sub makeDigestFunc {
   #     die "Expected dbManager and db keys in dbConfig arg passed to makeDigestFunc";
   #   }
   # }
-
+use DDP;
   return sub {
     my $aaAref = shift;
-  p $aaAref;
+
     my @cutSites;
     my $lastCutSite = 0;
 
@@ -70,6 +71,10 @@ sub makeDigestFunc {
     my $start;
     my $seq;
     my @peptides;
+
+    # say "AAREF is";
+    # p $aaAref;
+    # sleep(1);
     for my $aa (@$aaAref) {
       $i++;
 
@@ -100,6 +105,9 @@ sub makeDigestFunc {
       # and because end in the above is $i + 1
       if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
         push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+
+        say STDERR "peptides";
+        p @peptides;
       }
 
       if ( $end == @$aaAref ) {
@@ -114,6 +122,9 @@ sub makeDigestFunc {
 
           if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
             push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+
+            say STDERR "peptides";
+            p @peptides;
           }
         }
       }
@@ -121,7 +132,10 @@ sub makeDigestFunc {
       $lastCutSite = $end;
     }
 
-    return @peptides;
+    say STDERR "Got peptides";
+    p @peptides;
+
+    return \@peptides;
   }
 
   # return $digestFuncs{$type};

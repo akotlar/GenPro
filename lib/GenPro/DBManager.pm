@@ -1086,23 +1086,27 @@ sub dbDropDatabase {
 # to be required in any methods
 # TODO: pass configuration hash, rather than N arguments
 # TODO: allow opening of readOnly databases, not just environments?
+# @param config: dontCreate <Bool>, readOnly <Bool>, maxDbs <Int>, mapSize <Int>, stringKeys <Bool>
 sub _getDbi {
 
   # Exists and not defined, because in read only database we may discovercea
   # that some chromosomes don't have any data (example: hg38 refSeq chrM)
-  # my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs, $readOnly ) = @_;
-  #       $_[0]  $_[1], $_[2],      $_[3],        $_[4],   $_[5],   $_[6]
-  if ( $_[0]->envs->{ $_[1] } && $_[0]->envs->{ $_[1] }{dbs}{ $_[4] || 0 } ) {
-    return $_[0]->envs->{ $_[1] }{dbs}{ $_[4] || 0 };
+  # my ( $self, $name, $table, $onfig ) = @_;
+  #       $_[0]  $_[1], $_[2],  
+  
+  if (  $_[0]->envs->{ $_[1] } && $_[0]->envs->{ $_[1] }{ $_[2] || 0 } ) {
+    return $_[0]->envs->{ $_[1] }{ $_[2] || 0 };
   }
 
   # say STDERR "Couldn't find $_[1]:$_[4]";
-  my ( $self, $name, $dontCreate, $stringKeys, $namedDb, $maxDbs, $mapSize ) = @_;
+  my ( $self, $name, $table, $config ) = @_;
+
+  $table //= 0;
 
   # MDB_NOTLS must be used, because over some # of databases,
   #
   my $flags;
-  if ( $instanceConfig{readOnly} ) {
+  if ( $instanceConfig{readOnly} || $config->{readOnly} ) {
     #MDB_RDONLY can also be set per-transcation; it's just not mentioned
     #in the docs
     $flags = MDB_NOTLS | MDB_NOLOCK | MDB_RDONLY | MDB_NORDAHEAD;
@@ -1116,12 +1120,13 @@ sub _getDbi {
   }
 
   if ( !$self->envs->{$name}{env} ) {
-    $maxDbs //= 0;
+    # Must always be at least 1;
+    my $maxDbs = ( $config->{maxDbs} || 0 ) + 1;
 
     # Maximum db size
     # This * # of environments must be < 2^48 or maybe 2^47
     # else out of memory (64bit CPU != 64 bit addressable)
-    $mapSize //= 16 * 1024 * 1024 * 1024;
+    my $mapSize = $config->{mapSize} || 16 * 1024 * 1024 * 1024;
 
     my $dbPath = $instanceConfig{databaseDir}->child($name);
 
@@ -1129,15 +1134,8 @@ sub _getDbi {
     if ( !$dbPath->is_dir ) {
       # If dbReadOnly flag set, this database will NEVER be created during the
       # current execution cycle
-      if ( $instanceConfig{readOnly} ) {
-        $self->_errorWithCleanup("Called _getDbi, but readOnly set and database folder doesn't exist");
-      }
-
-      if ($dontCreate) {
-
-        # dontCreate does not imply the database will never be created,
-        # so we don't want to update $self->_envs
-        $self->_errorWithCleanup("Called _getDbi, but $dontCreate passed and database folder doesn't exist");
+      if ( $instanceConfig{readOnly} || $config->{readOnly} || $config->{dontCreate} ) {
+        $self->_errorWithCleanup("Called _getDbi, but readOnly or dontCreate set and database folder doesn't exist");
       }
 
       $dbPath->mkpath;
@@ -1151,14 +1149,14 @@ sub _getDbi {
         mapsize    => $mapSize,
         mode       => 0600,
         flags      => $flags,
-        maxdbs     => $maxDbs > 0 ? $maxDbs + 1 : $maxDbs,
+        maxdbs     => $maxDbs,
         maxreaders => 32,
       }
     );
 
     if ( !$env ) {
       $self->_errorWithCleanup(
-        "Failed to create environment $name:$namedDb for $instanceConfig{databaseDir}
+        "Failed to create environment $name:$table for $instanceConfig{databaseDir}
         beacuse of $LMDB_File::last_err"
       );
     }
@@ -1172,7 +1170,7 @@ sub _getDbi {
 
   if ($LMDB_File::last_err) {
     $self->_errorWithCleanup(
-      "Failed to associate transaction with environment $name:$namedDb
+      "Failed to associate transaction with environment $name:$table
       beacuse of $LMDB_File::last_err"
     );
   }
@@ -1181,20 +1179,20 @@ sub _getDbi {
 
   # Much faster random, somewhat faster sequential performance
   # Much smaller database size (4 byte keys, vs 6-10 byte keys)
-  if ( !$stringKeys ) {
+  if ( !$config->{stringKeys} ) {
     # say STDERR "Opening $name, $namedDb as integer keys";
     $dbFlags = MDB_INTEGERKEY;
   }
 
-  if ( !$dontCreate ) {
+  if ( !$config->{dontCreate} ) {
     $dbFlags = $dbFlags | MDB_CREATE;
   }
 
-  my $DB = $txn->OpenDB( $namedDb, $dbFlags );
+  my $DB = $txn->OpenDB( $table, $dbFlags );
   
   if ($LMDB_File::last_err) {
     $self->_errorWithCleanup(
-      "Failed to open database $name:$namedDb for
+      "Failed to open database $name:$table for
       $instanceConfig{databaseDir} beacuse of $LMDB_File::last_err"
     );
   }
@@ -1217,8 +1215,8 @@ sub _getDbi {
   # our database should be opened with sync enabled.
   $env->set_flags(MDB_NOSYNC, 1);
 
-  $namedDb //= 0;
-  $self->envs->{$name}{dbs}{$namedDb} = {
+  $table //= 0;
+  $self->envs->{$name}{dbs}{$table} = {
     dbi    => $DB->dbi,
     db     => $DB,
     tflags => $flags,
@@ -1227,7 +1225,7 @@ sub _getDbi {
 
   # $envs{$name}{txn} = 0;
 
-  return $self->envs->{$name}{dbs}{$namedDb};
+  return $self->envs->{$name}{dbs}{$table};
 }
 
 # TODO: test with Txn->env->sync instead of {env}->sync
