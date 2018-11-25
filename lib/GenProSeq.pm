@@ -170,6 +170,7 @@ sub annotate {
       env => $refPeptideEnv,
     }
   });
+
   say STDERR "FINISHED STEP 4 (make per-sample database of unique peptides digested by trypsin)";
   # # We may get rid of this step
   # # ( $err ) = $self->createPersProtPermutations($sampleList, $wantedTxNums);
@@ -196,7 +197,8 @@ sub makeReferenceProtDb {
   my $geneTrackGetter = $tracks->getTrackGetterByName($geneTrack);
   my $geneTrackGetterDbName = $geneTrackGetter->dbName;
 
-  my ($writtenChrsHref, $txNumsAref) = $self->_checkHasTxNumToWrite($wantedTxNumHref, $metaEnv, $metaConfig, \%metaKeys);
+  my ($writtenChrsHref, $txNumsAref) = $self->_checkHasTxNumToWrite($wantedTxNumHref, $metaEnv, $metaConfig, $metaKeys{refTxsWritten});
+
   # Ensure that we crate the necessary databases before entering threads
   # It *seems* I don't need to pre-make databases
   # TODO: write tests
@@ -262,7 +264,6 @@ sub makeReferenceProtDb {
     my $db = Seq::DBManager->new();
     my $personalDb = GenPro::DBManager->new();
   
-    my %seenCodonRanges;
     my %cursors;
     my %seenChrs;
     my %dbs;
@@ -299,16 +300,6 @@ sub makeReferenceProtDb {
       $cdsStart = $tx->{$cdsStartFeatIdx};
       $cdsEnd = $tx->{$cdsEndFeatIdx};
       @data = ($cdsStart .. $cdsEnd - 1);
-
-      $seenCodonRanges{$chr} //= {};
-      $seenCodonRanges{$chr}{$cdsStart} //= {};
-
-      # Don't do this!!!
-      # if($seenCodonRanges{$chr}{$cdsStart}{$cdsEnd}) {
-      #   next;
-      # }
-
-      $seenCodonRanges{$chr}{$cdsStart}{$cdsEnd} = 1;
 
       if($strand eq '-') {
         @data = reverse @data;
@@ -416,17 +407,6 @@ sub makeReferenceProtDb {
       # although we could just ignore the de-normalized data
       # my $txn = $dbs{$chr}{env}->BeginTxn();
       $personalDb->dbPut($dbs{$chr}, $txNumber, [\@aaSequence, \@codonSequence, [$txName, $cdsStart, $cdsEnd]]);
-      
-      # if($txNumber == 438) {
-      #   say STDERR "Put in txNumber 438";
-
-      #   my $val =  $personalDb->dbReadOne($dbs{$chr}, $txNumber);
-
-      #   p $val;
-      #   sleep(5);
-      # }
-      
-      # $txn->commit();
     }
 
     MCE->gather(\%seenChrs);
@@ -438,28 +418,28 @@ sub makeReferenceProtDb {
 
   MCE::Loop::finish();
 
-  $self->_recordTxNumsWritten($writtenChrsHref, $metaEnv, $metaConfig, \%metaKeys);
+  $self->_recordTxNumsWritten($writtenChrsHref, $metaEnv, $metaConfig, $metaKeys{refTxsWritten});
 }
 
 sub _recordTxNumsWritten {
-  my ($self, $writtenChrsHref, $metaEnv, $metaConfig, $metaKeysHref);
+  my ($self, $writtenChrsHref, $metaEnv, $metaConfig, $metaKey);
 
   my $personalDb = GenPro::DBManager->new();
 
   my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
-    $personalDb->dbPut( $metaDb, $metaKeysHref->{refTxsWritten}, $writtenChrsHref );
+    $personalDb->dbPut( $metaDb, $metaKey, $writtenChrsHref );
   undef $metaDb;
 
   $personalDb->cleanUp();
 }
 
 sub _checkHasTxNumToWrite {
-  my ($self, $wantedTxNumHref, $metaEnv, $metaConfig, $metaKeysHref) = @_;
+  my ($self, $wantedTxNumHref, $metaEnv, $metaConfig, $metaKey) = @_;
 
   my $personalDb = GenPro::DBManager->new();
 
   my $metaDb = $personalDb->_getDbi( $metaEnv, undef,$metaConfig);
-    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeysHref->{refTxsWritten} );
+    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $mmetaKey );
   undef $metaDb;
 
   my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
@@ -498,55 +478,31 @@ sub makeReferenceUniquePeptides {
   # for now assume we'll have trypsin, chymotrypsin, lyse-c
   my $nEnzymeTables = 3;
 
-  my $personalDb = GenPro::DBManager->new();
-
+  my ($writtenChrsHref, $txNumsAref) = $self->_checkHasTxNumToWrite($wantedTxNumHref, $metaEnv, $metaConfig, $metaKeys{refPeptidesWritten});
+ 
   # TODO: size the database based on the number of possible enzymes
   # TODO: think about combining refProtEnv and refPeptideEnv
-  for my $enzyme (@$wantedEnzymesAref) {
-    $personalDb->_getDbi( $refPeptideEnv, $enzyme, $refPeptideConfig );
-  }
+  # It doesn't seem like this is necessary
+  # https://www.openldap.org/lists/openldap-technical/201608/msg00067.html
+  # Not 100% sure that we don't have a race condition during database creation
+  # for my $enzyme (@$wantedEnzymesAref) {
+  #   $personalDb->_getDbi( $refPeptideEnv, $enzyme, $refPeptideConfig );
+  # }
 
-  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
-    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeys{refPeptidesWritten} );
-  undef $metaDb;
-
-  # Clear the singleton instance, ensure that threads don't copy any memory
-  $personalDb->cleanUp();
-  undef $personalDb;
-
-  my %writtenTxNums = $previouslyWritten ? %$previouslyWritten : ();
-
-  my @txNums;
-  my %wantedChrs;
-  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
-    $wantedChrs{$chr} //= 1;
-
-    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
-      if($writtenTxNums{$chr} && $writtenTxNums{$chr}{$txNum}) {
-        next;
-      }
-
-      push @txNums, [$chr, $txNum];
-    }
-  }
-
-  if(@txNums == 0) {
+  if(@txNumsAref == 0) {
     return;
   }
-
-  # TODO: when working with named databases, must open each time with same flags
-  # and I think, same number of maxDbs (or at least, no fewer max dbs?)
-  my $nChrs = %wantedChrs;
   
   my %refProtRdOnlyConfig = (%{$self->refProtConfig}, (readOnly => 1));
+
   my $progressFunc = sub {
     my $seenTxNums = shift;
 
     for my $chr (keys %$seenTxNums) {
-      $writtenTxNums{$chr} //= {};
+      $writtenChrsHref->{$chr} //= {};
 
       for my $txNum (keys %{$seenTxNums->{$chr}}) {
-        $writtenTxNums{$chr}{$txNum} = 1;
+        $writtenChrsHref->{$chr}{$txNum} = 1;
       }
     }
   };
@@ -637,17 +593,11 @@ sub makeReferenceUniquePeptides {
     # undef %refProtDbs;
     # undef %dbs;
     # $personalDb->cleanUp()
-  } @txNums;
+  } @$txNumsAref;
 
   MCE::Loop::finish();
 
-  $personalDb = GenPro::DBManager->new();
-
-  $metaDb = $personalDb->_getDbi($metaEnv, undef, $metaConfig);
-    $personalDb->dbPut( $metaDb, $metaKeys{refPeptidesWritten}, \%writtenTxNums );
-  undef $metaDb;
-
-  $personalDb->cleanUp();
+  $self->_recordTxNumsWritten($writtenChrsHref, $metaEnv, $metaConfig, $metaKeys{refPeptidesWritten});
 }
 
 # TODO: check if number wantedTxNumHref has changed
