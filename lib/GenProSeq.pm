@@ -126,18 +126,15 @@ sub BUILD {
 sub annotate {
   my $self = shift;
 
-  # TODO: Handle Sig Int (Ctrl + C) to close db, clean up temp dir
-  # local $SIG{INT} = sub {
-  #   my $message = shift;
-  # };
-
+  # TODO: read geneTrack from YAML
+  my $geneTrack = 'refSeq';
   my ($err, $sampleList, $wantedTxNums);
 
   # TODO: Allow configuration of track, features
   # TODO: extract config needed by makeSampleUniquePeptides?
   my $sampleBuilder = GenPro::SampleBuilder->new({
     inputFile => $self->input_file,
-    geneTrack => 'refSeq',
+    geneTrack => $geneTrack,
     fileProcessors => $self->fileProcessors,
     # TODO: this is clunky (from Seq::Definition)
     output_file_base => $self->output_file_base,
@@ -150,7 +147,9 @@ sub annotate {
 
   say STDERR "FINISHED STEP 1 (make personal replacement db)";
 
-  ( $err ) = $self->makeReferenceProtDb($wantedTxNums);
+  ( $err ) = $self->makeReferenceProtDb($wantedTxNums, {
+    geneTrack => $geneTrack,
+  });
 
   say STDERR "FINISHED STEP 2 (make reference protein db for requested txNumbers)";
 
@@ -188,57 +187,32 @@ sub annotate {
 # Generates everything that GenPro_make_refprotdb does
 # Also pre-calculates all digested peptides, and stores those
 sub makeReferenceProtDb {
-  my ($self, $wantedTxNumHref) = @_;
+  my ($self, $wantedTxNumHref, $config) = @_;
+
+  my $geneTrack = $config->{geneTrack};
 
   my $personalDb = GenPro::DBManager->new();
-  
-  my $metaDb = $personalDb->_getDbi( $metaEnv, undef,$metaConfig);
-    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeys{refTxsWritten} );
-  undef $metaDb;
-
-  my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
-
-  my @txNums;
-  my %wantedChrs;
-  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
-    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
-      push @txNums, [$chr, $txNum];
-    }
-
-    $wantedChrs{$chr} //= 1;
-  }
-
-  # TODO: get the name string in some other way, maybe from YAML
-  # or as an argument
-  my $db              = $self->{_db};
-  my $geneTrackGetter = $self->tracksObj->getTrackGetterByName('refSeq');
+  my $tracks = Seq::Tracks->new();
+  my $geneTrackGetter = $tracks->getTrackGetterByName($geneTrack);
   my $geneTrackGetterDbName = $geneTrackGetter->dbName;
 
-  my %regionDb;
-  my $nChrs = %wantedChrs;
-  my $haveWritten = 0;
-
+  my ($writtenChrsHref, $txNumsAref) = $self->_checkHasTxNumToWrite($wantedTxNumHref, $metaEnv, $metaConfig, \%metaKeys);
   # Ensure that we crate the necessary databases before entering threads
   # It *seems* I don't need to pre-make databases
   # TODO: write tests
-  for my $chr ( keys %wantedChrs ) {
-    $regionDb{$chr} //= $db->dbReadAll( $geneTrackGetter->regionTrackPath($chr) );
 
-    # Run here, in case we have yet to create this environment, before
-    # we get to multi-threaded code.
-    # Doesn't seem to be necessary
-    # $personalDb->_getDbi( $refProtEnv, 0, 0, $chr, $nChrs );
+  # Pre-load all transcript info
+  my %regionDb;
+  {
+    # Control scope (Rust)
+    my $db = Seq::DBManager->new();
 
-    if(defined $writtenChrs{$chr}) {
-      $haveWritten++;
+    for my $chr ( keys %$wantedTxNumHref ) {
+      $regionDb{$chr} //= $db->dbReadAll( $geneTrackGetter->regionTrackPath($chr) );
     }
   }
 
-  # Clear the singleton instance, ensure that threads don't copy any memory
-  $personalDb->cleanUp();
-  undef $personalDb;
-
-  if($haveWritten == keys %wantedChrs) {
+  if(%$writtenChrsHref == %$wantedTxNumHref) {
     return;
   }
 
@@ -246,7 +220,7 @@ sub makeReferenceProtDb {
     my $seenChrs = shift;
 
     for my $chr (keys %$seenChrs) {
-      $writtenChrs{$chr} //= 1;
+      $writtenChrsHref->{$chr} //= 1;
     }
   };
 
@@ -285,7 +259,8 @@ sub makeReferenceProtDb {
   mce_loop {
     my ($mce, $chunk_ref, $chunk_id) = @_;
 
-    $personalDb = GenPro::DBManager->new();
+    my $db = Seq::DBManager->new();
+    my $personalDb = GenPro::DBManager->new();
   
     my %seenCodonRanges;
     my %cursors;
@@ -459,29 +434,62 @@ sub makeReferenceProtDb {
     # Remove our pointers so LMDB can clean up properly
     # undef %dbs;
     # $personalDb->cleanUp();
-  } @txNums;
+  } @$txNumsAref;
 
   MCE::Loop::finish();
 
-  $personalDb = GenPro::DBManager->new();
+  $self->_recordTxNumsWritten($writtenChrsHref, $metaEnv, $metaConfig, \%metaKeys);
+}
 
-  $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
-    $personalDb->dbPut( $metaDb, $metaKeys{refTxsWritten}, \%writtenChrs );
+sub _recordTxNumsWritten {
+  my ($self, $writtenChrsHref, $metaEnv, $metaConfig, $metaKeysHref);
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
+    $personalDb->dbPut( $metaDb, $metaKeysHref->{refTxsWritten}, $writtenChrsHref );
   undef $metaDb;
 
   $personalDb->cleanUp();
-  $db->cleanUp();
+}
+
+sub _checkHasTxNumToWrite {
+  my ($self, $wantedTxNumHref, $metaEnv, $metaConfig, $metaKeysHref) = @_;
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef,$metaConfig);
+    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKeysHref->{refTxsWritten} );
+  undef $metaDb;
+
+  my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
+
+  my @txNums;
+  my %wantedChrs;
+  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
+    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
+      push @txNums, [$chr, $txNum];
+    }
+
+    $wantedChrs{$chr} //= 1;
+  }
+
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+  undef $personalDb;
+
+  return (\%wantedChrs, \@txNums);
 }
 
 # Generates everything that GenPro_make_refprotdb does
 # Also pre-calculates all digested peptides, and stores those
 sub makeReferenceUniquePeptides {
-  my ($self, $wantedSamples, $wantedTxNumHref, $wantedEnzymesAref) = @_;
-
-  $wantedEnzymesAref //= ['trypsin'];
+  my ($self, $wantedSamples, $wantedTxNumHref) = @_;
 
   my %digestFuncs;
   my $digest = GenPro::Digest->new();
+
+  my $wantedEnzymesAref = $digest->enzymes;
 
   for my $enzyme (@$wantedEnzymesAref) {
     $digestFuncs{$enzyme} = $digest->makeDigestFunc($enzyme);
@@ -648,7 +656,8 @@ sub makeReferenceUniquePeptides {
 sub makeSampleUniquePeptides {
   my ($self, $wantedSamplesHref, $wantedTxNumHref, $configs) = @_;
 
-  my $wantedEnzymesAref = ['trypsin'];
+  my $digest = GenPro::Digest->new();
+  my $wantedEnzymesAref = $digest->enzymes;
 
   my $sampleConfig = $configs->{sample};
   my $sampleFeatureDbIdx = $sampleConfig->{featureDbIdx};

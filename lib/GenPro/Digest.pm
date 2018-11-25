@@ -24,6 +24,11 @@ my %digestLookups = (
   }
 );
 
+# Don't configure twice; derive state from our capabilities
+has enzymes => (is => 'ro', isa => 'ArrayRef', init_arg => undef, default => sub {
+  return [ sort {$a cmp $b} keys %digestLookups ];
+});
+
 has digestLookups => (is => 'ro', isa => 'HashRef', init_arg => undef, default => sub {
   return \%digestLookups;
 });
@@ -34,10 +39,6 @@ has digestLookups => (is => 'ro', isa => 'HashRef', init_arg => undef, default =
 # Also, if provided, it will check uniqueness
 sub makeDigestFunc {
   my ($self, $type, $dbConfig) = @_;
-
-  # if($digestFuncs{$type}) {
-  #   return $digestFuncs{$type};
-  # }
 
   # Cache because Perl/Mouse accessors slow
   my $minPeptideLength = $self->minPeptideLength;
@@ -50,17 +51,6 @@ sub makeDigestFunc {
     croak "We don't know how to digest $type";
   }
 
-  # my ($dbManager, $db);
-
-  # if($dbConfig) {
-  #   $dbManager = $dbConfig->{dbManager};
-  #   $db = $dbConfig->{db};
-
-  #   if(!$dbManager && $db) {
-  #     die "Expected dbManager and db keys in dbConfig arg passed to makeDigestFunc";
-  #   }
-  # }
-use DDP;
   return sub {
     my $aaAref = shift;
 
@@ -72,9 +62,6 @@ use DDP;
     my $seq;
     my @peptides;
 
-    # say "AAREF is";
-    # p $aaAref;
-    # sleep(1);
     for my $aa (@$aaAref) {
       $i++;
 
@@ -128,8 +115,6 @@ use DDP;
 
     return @peptides;
   }
-
-  # return $digestFuncs{$type};
 }
 
 __PACKAGE__->meta->make_immutable();

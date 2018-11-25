@@ -536,7 +536,6 @@ sub makePersonalProtDb {
   return ( undef, $completedHref, $recordedTxNumsHref );
 }
 
-
 sub _writeSampleCompleted {
   my ($self, $completedHref, $recordedTxNumsHref) = @_;
 
