@@ -20,7 +20,7 @@ use YAML::XS qw/LoadFile/;
 
 use Getopt::Long::Descriptive;
 
-use GenProSeq;
+use GenPro;
 with 'MouseX::Getopt';
 
 ##########Parameters accepted from command line#################
@@ -179,7 +179,7 @@ sub annotate {
     $args->{maxThreads} = $self->maxThreads;
   }
 
-  my $annotator = GenProSeq->new_with_config($args);
+  my $annotator = GenPro->new_with_config($args);
   $annotator->annotate();
 }
 

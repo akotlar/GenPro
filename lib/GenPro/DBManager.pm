@@ -451,7 +451,7 @@ sub _getDbi {
   if ( $instanceConfig{readOnly} || $config->{readOnly} ) {
     #MDB_RDONLY can also be set per-transcation; it's just not mentioned
     #in the docs
-    $flags = MDB_NOTLS | MDB_NOLOCK | MDB_RDONLY | MDB_NORDAHEAD;
+    $flags = MDB_NOTLS | MDB_RDONLY | MDB_NORDAHEAD;
   } else {
     # We read synchronously during building, which is our only mixed workload
     # Without NOTLS LMDB will deadlock, at least on Mac OSX, when spawning

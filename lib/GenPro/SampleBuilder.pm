@@ -13,18 +13,13 @@ use namespace::autoclean;
 
 use MCE::Loop;
 
-
-use Seq::InputFile;
-use Seq::Output;
-use Seq::Output::Delimiters;
-use Seq::Tracks::Build::CompletionMeta;
-use Seq::Tracks::Gene;
 use Seq::Headers;
+use Seq::DBManager;
+use Seq::Tracks;
+use Seq::Tracks::Gene::Definition;
 
 use GenPro::DBManager;
 
-use Seq::DBManager;
-use Seq::Tracks;
 use Path::Tiny;
 use DDP;
 
