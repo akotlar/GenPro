@@ -14,7 +14,7 @@ has maxPeptideLength => (is => 'ro', isa => 'Int', default => 40);
 
 my %digestLookups = (
   trypsin => {
-    cut => { 
+    cut => {
       R => 1,
       K => 1,
     },
@@ -37,6 +37,7 @@ has digestLookups => (is => 'ro', isa => 'HashRef', init_arg => undef, default =
 # dbManager and db, where db is a database configuration
 # and should be callable as dbManager->dbReadOne($db, $peptide);
 # Also, if provided, it will check uniqueness
+
 sub makeDigestFunc {
   my ($self, $type, $dbConfig) = @_;
 
@@ -83,7 +84,7 @@ sub makeDigestFunc {
 
     # reset
     $lastCutSite = 0;
-    
+
     $i = -1;
     for my $end (@cutSites) {
       $i++;

@@ -48,7 +48,7 @@ my %metaKeys = (
 
 my $metaConfig = {stringKeys => 1};
 
-# Taken as arguments / config 
+# Taken as arguments / config
 has fileProcessors => ( is => 'ro', isa => 'HashRef', required => 1);
 has chromosomes => ( is => 'ro', isa => 'ArrayRef', required => 1);
 
@@ -139,7 +139,7 @@ sub annotate {
     }
   });
 
-  say STDERR "FINISHED STEP 4 (make per-sample database of unique peptides digested by trypsin)";
+  say STDERR "FINISHED STEP 3 (make per-sample database of unique peptides digested by trypsin)";
   # # We may get rid of this step
   # # ( $err ) = $self->createPersProtPermutations($sampleList, $wantedTxNums);
 
@@ -205,6 +205,8 @@ sub makeSampleUniquePeptides {
     return;
   }
 
+  my $fastaFn = _makeFastaPrintFn($sampleFeatureDbIdx);
+
   my $txNumberIdx = $sampleFeatureDbIdx->{txNumber};
 
   my $progressFunc = sub {
@@ -232,7 +234,6 @@ sub makeSampleUniquePeptides {
 
     # Thread-local instance
     $personalDb = GenPro::DBManager->new();
-
 
     my %refProteinDbs;
 
@@ -265,7 +266,7 @@ sub makeSampleUniquePeptides {
           my $userVars = $userTxHref->{$txNum};
 
           if(@$userVars > 21) {
-            say STDERR "Tx number $txNum on chr $chr has too many variants ( " . @$userVars . ')';
+            say STDERR "tooManyVariants;txNum:$txNum;chr:$chr;n: " . @$userVars;
             next;
           }
 
@@ -278,7 +279,6 @@ sub makeSampleUniquePeptides {
           my $uniquePeptidesAref = $txHasUniquePeptidesFn->($userVars, $refSequenceInfo->[0]);
 
           if(!@$uniquePeptidesAref) {
-            # say STDERR "Couldn't find any peptides";
             next;
           }
 
@@ -287,7 +287,7 @@ sub makeSampleUniquePeptides {
           # as $txHasUniquePeptidesFn stores
           # \@{all affected txs}, \@{alt aa sequence}, \@uniquePeptides
           # where uniquePeptides is also modified by sortByUniquePeptides
-          my @sortedRecs = sortUniquePeptides($uniquePeptidesAref, $txNum, $personalDb, $samplePeptideDb);
+          my @sortedRecs = _sortUniquePeptides($uniquePeptidesAref, $txNum, $personalDb, $samplePeptideDb);
 
           while(@sortedRecs) {
             my $rec = shift @sortedRecs;
@@ -297,7 +297,6 @@ sub makeSampleUniquePeptides {
             # will remove all peptides previously seen in this sample
             for my $peptide (@{$rec->[2]}) {
               $personalDb->dbPut($samplePeptideDb, $peptide, [1, [$txNum]]);
-              # say STDERR "PUTTING: " . $peptide;
             }
 
             # Checks all of the pre-generated peptides
@@ -309,9 +308,16 @@ sub makeSampleUniquePeptides {
             # and 2nd round of checking against the reference db, which is invariant
             # (so this function checks only against the sample db, which is
             # updated in the line above thise)
-            @sortedRecs = sortUniquePeptides(\@sortedRecs, $txNum, $personalDb, $samplePeptideDb);
+            @sortedRecs = _sortUniquePeptides(\@sortedRecs, $txNum, $personalDb, $samplePeptideDb);
           }
         }
+      }
+
+      #  TODO: figure out  if we can really get away with sort step being done per tx
+      # If so, we can print inside the chr loop, save memory
+      if(@finalRecords) {
+        MCE->say($fastaFn->($sample, \@finalRecords));
+        # _printJson($sample, \@finalRecords);
       }
     }
 
@@ -332,6 +338,64 @@ sub makeSampleUniquePeptides {
   return;
 }
 
+
+sub _makeFastaPrintFn {
+  # The sample variant features
+  my $featureDbIdx = shift;
+
+  my $codonNumIdx = $featureDbIdx->{codonNumber};
+  my $codonPosIdx = $featureDbIdx->{codonPosition};
+  my $posIdx = $featureDbIdx->{pos};
+  my $refIdx = $featureDbIdx->{ref};
+  my $altIdx = $featureDbIdx->{alt};
+  my $altAaIdx = $featureDbIdx->{altAminoAcid};
+  my $refAaIdx = $featureDbIdx->{refAminoAcid};
+
+  my @names = ('name2', 'name', 'spID', 'spDisplayID', 'ensemblID', 'kgID');
+  my @fIdx = map { $featureDbIdx->{$_} } @names;
+  my @idx = 0 .. $#names;
+
+  return sub {
+    my ($sample, $finalRecordsAref) = @_;
+
+    my @out;
+    for my $rec (@$finalRecordsAref) {
+      # my $info = $rec->[0];
+
+      # This assumes that the tx name, etc is same for all modificaitons
+      # Which should be sound, as we are supposed to be generating these
+      # per transcript number
+
+      my (@c, @p, @g, $altAa);
+
+      for my $r (@{$rec->[0]}) {
+        my $cSite = 3 * $r->[$codonNumIdx] + $r->[$codonPosIdx];
+        # my $altAa = $r->[$altAaIdx];
+        # my $ref
+        push @c, sprintf("c.%d%s>%s", $cSite, $r->[$refAaIdx], $r->[$altAaIdx]);
+        push @p, sprintf("p.%d%s>%s", $r->[$codonNumIdx], $r->[$refAaIdx],$r->[$altAaIdx]);
+        push @g, sprintf("g.%d%s>%s", $r->[$posIdx], $r->[$refIdx], $r->[$altIdx]);
+      }
+
+      my $tx = $rec->[0][0];
+      my $mods = join(',', map {
+        $rec->[$_]
+      } 0 .. $#$rec);
+
+      my $header = join('|', map {
+        $names[$_] . '=' . (
+          ref $tx->[$fIdx[$_]]
+          ? join(',', @{$tx->[$fIdx[$_]]})
+          : (defined $tx->[$fIdx[$_]] ? $tx->[$fIdx[$_]] : '.')
+        )
+      } @idx ) . '|' . join(',', @c) . '|' . join(',', @p) . '|' . join(',', @g);
+
+      push @out, ">$header\n" . join('', @{$rec->[1]});
+    }
+
+    return join("\n", @out);
+  }
+}
 # Takes a variant record, with N affected transcripts,
 # de-convolutes those,
 # returning per-transcript data, indexed on some desired transcript value
@@ -364,7 +428,7 @@ sub _orderByDesired {
 }
 
 # Only sorts peptides, and updates counts, txNumbers of non-unique peptides
-sub sortUniquePeptides {
+sub _sortUniquePeptides {
   my ($recsAref, $txNum, $dbManager, $db) = @_;
 
   my @finalRecords;
@@ -397,51 +461,6 @@ sub sortUniquePeptides {
   return @finalRecords;
 }
 
-sub storeUniquePeptides {
-  my ($rec, $txNum, $dbManager, $db);
-
-  for my $peptide (@${$rec->[2]}) {
-    $dbManager->dbPut($db, $peptide, [1, $txNum]);
-  }
-
-  return;
-}
-
-sub sortAndStoreUniquePeptides {
-  my ($recsAref, $txNum, $dbManager, $db);
-
-  my @finalRecords;
-
-  for my $rec (sort { @{$b->[2]} <=> @{$a->[2]} } @$recsAref) {
-    # Check each peptide against
-    my @uniquePeptides;
-
-    for my $peptide (@${$rec->[2]}) {
-      my $seenAref = $dbManager->dbReadOne($db, $peptide, 1);
-
-
-      if(!defined $seenAref) {
-        push @uniquePeptides, $peptide;
-
-        $seenAref = [ 1, [$txNum] ];
-      } else {
-        $seenAref->[0] += 1;
-        push @{$seenAref->[1]}, $txNum;
-      }
-
-      $dbManager->dbPut($db, $peptide, $seenAref);
-    }
-
-    if(@uniquePeptides > 0) {
-      $rec->[2] = \@uniquePeptides;
-
-      push @finalRecords, $rec;
-    }
-  }
-
-  return @finalRecords;
-}
-
 sub makeVarProtForTxFn {
   my $config = shift;
 
@@ -462,8 +481,6 @@ sub makeVarProtForTxFn {
 
     my (@uniqueRecords, %seqWithUnique);
 
-    my $lastCodonNum;
-
     if(!$refAaSeq->[-1] eq '*') {
       say STDERR "Got a transcript without a trailing stop";
       $seqWithUnique{-9} = [ undef, [@$refAaSeq], undef ];
@@ -471,16 +488,19 @@ sub makeVarProtForTxFn {
       $seqWithUnique{-9} = [ undef, [ @$refAaSeq[ 0 .. $#$refAaSeq - 1 ] ], undef ];
     }
 
-    my $max = -9 + sum map { $_->[$codonNumIdx] } @$varTxAref;
-    # my $max = "-9" . join(" ", @$varTxAref);
+    my $max = -9; #+ sum map { $_->[$codonNumIdx] } @$varTxAref;
 
-    for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
-      my $codonNum = $var->[$codonNumIdx];
+    # TODO: do we want to sort and drop based on the lastCodon condition?
+    # for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
+    for my $var (@$varTxAref) {
+      my $codonIdx = $var->[$codonNumIdx] - 1;
 
+      # This only works if we don't break out of this loop early
+      $max += $codonIdx;
       # TODO: CHECK ON THIS: THOMAS HAS THIS INITIALIZED TO 1, WHICH I THINK
       # MAY CAUSE SOME COMBINATIONS NOT TO BE SEEN (WHEN THE FIRST CODON)
       # IS > maxPeptideLength away
-      $lastCodonNum //= $codonNum;
+      # $lastCodonNum //= $codonNum;
 
       # We can avoid running this condition if we
       # Both of these are 1-based, so add 1 to be consistent with other
@@ -491,24 +511,30 @@ sub makeVarProtForTxFn {
       #   last;
       # }
 
-      $lastCodonNum = $codonNum;
+      # $lastCodonNum = $codonNum;
 
-      my $altAa = $var->[$altAaIdx];
+      # my $altAa = $var->[$altAaIdx];
 
-      if(!$cutsHref->{$altAa}) {
+      if(!$cutsHref->{$var->[$altAaIdx]}) {
         next;
       }
 
-      my $refAa = $var->[$refAaIdx];
+      # my $refAa = $var->[$refAaIdx];
 
-      if($refAa ne $seqWithUnique{-9}[1][$codonNum - 1]) {
-        die "NOT EQUAL at codon $codonNum of $seqWithUnique{-9}";
+      # my $expectedRef = $seqWithUnique{-9}[1][$codonNum - 1];
+
+      # if(!defined $expectedRef) {
+      #   p %seqWithUnique;
+      #   p $varTxAref;
+      #   p $refAaSeq;
+      #   die "Not defined $codonNum: $refAa";
+      # }
+
+      if($var->[$refAaIdx] ne $seqWithUnique{-9}[1][$codonIdx]) {
+        die "Sample's ref AA != reference amino acid $seqWithUnique{-9}[1][$codonIdx] @ codonIdx: $codonIdx";
       }
 
-      $lastCodonNum = $codonNum;
-
       for my $i (keys %seqWithUnique) {
-        # say STDERR "Checking seqWithUnique key $i";
         # Copy this mutated allele (or reference if first iteration)
         # Mutate that
         my @newSeq = @{$seqWithUnique{$i}[1]};
@@ -523,7 +549,8 @@ sub makeVarProtForTxFn {
         #   next;
         # }
 
-        $newSeq[$codonNum - 1] = $altAa;
+        $newSeq[$codonIdx] = $var->[$altAaIdx];
+
         my @uniquePeptides = $globalUniquePeptideFn->(\@newSeq);
 
         if(@uniquePeptides == 0) {
@@ -553,16 +580,18 @@ sub makeVarProtForTxFn {
 
         # The value of the key is only import in that we want to know
         # whether we've made a record with all substitutions
-        $seqWithUnique{$i + $codonNum} = $recAref;
+        $seqWithUnique{$i + $codonIdx} = $recAref;
       }
     }
 
+    # Many times we'll never not have $max
     if(!$seqWithUnique{$max}) {
-      # Mutates the reference sequence copy we made, but we'll delete that
+      # Mutates the reference sequence copy we made
+      # This becomes our fully-mutated copy
       my $newSeq = $seqWithUnique{-9}[1];
 
       for my $var (@$varTxAref) {
-        $newSeq->[ $var->[$codonNumIdx] - 1] = $var->[$altAaIdx];
+        $newSeq->[ $var->[$codonNumIdx] - 1 ] = $var->[$altAaIdx];
       }
 
       my @uniquePeptides = $globalUniquePeptideFn->($newSeq);
@@ -599,7 +628,7 @@ sub _configureVarProtFn {
   my $digestFunc = $digest->makeDigestFunc('trypsin');
   my $cutsHref = $digest->digestLookups->{trypsin}{cut};
 
-  if(!$digestFunc) {
+  if(!($digestFunc && $cutsHref)) {
     die 'No digest func for trypsin';
   }
 

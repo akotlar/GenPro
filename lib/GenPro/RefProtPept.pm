@@ -2,6 +2,7 @@ use 5.10.0;
 use strict;
 use warnings;
 
+# TODO: Return error to gather function, synchronize errors across threads
 package GenPro::RefProtPept;
 
 use MCE::Loop;
@@ -27,7 +28,7 @@ my %metaKeys = (
   refPeptidesWritten => 'refPeptidesWritten',
 );
 
-my $metaEnv = 'genpro_ref_prot_peptide_meta';
+my $metaEnv = 'ref_prot_peptide_meta';
 my $metaConfig = {stringKeys => 1};
 
 # Required variables, and exports
@@ -193,8 +194,12 @@ sub makeReferenceProtDb {
       my ( $fetchedTxNumbers, $siteData, $wantedSiteData );
       my (@codonSequence, @aaSequence, @codonPos, @codonNums, @txNumOut);
 
+      my @warnings;
+      my $siteN = 0;
       my $lastCodonNumber;
       for my $site (@data) {
+        $siteN += 1;
+
         if(!defined) {
           die 'Err: no gene site';
         }
@@ -258,8 +263,11 @@ sub makeReferenceProtDb {
         # TODO: Write tests for such proteins
         # TODO: Maybe report errors if this is not at the end of the transcript
         # Convo w/ Thomas @ 11/13/18: Return the fragment, warn the user
-        if($aa eq '*') {
-          last;
+        # nSites + 2 since we always only evaluate the first site of each triplet
+        if($aa eq '*' && $siteN + 2 != @data) {
+          push @warnings, sprintf('earlyStop;tx:%d;name:%s;site:%d;codonN:%d;cdsStart:%d;cdsEnd:%d,codon:%s,len:%d',
+                          $txNumber, $txName, $siteN + 2, $codonNumber, $cdsStart, $cdsEnd, $codonSequence, scalar @data);
+          next;
         }
       }
 
@@ -279,16 +287,20 @@ sub makeReferenceProtDb {
       }
 
       # TODO: Move to testing package
-      if($regionDb{$chr}[$txNumber]{$nameFeatIdx} eq 'NM_033467') {
-        # https://www.ncbi.nlm.nih.gov/nuccore/NM_033467
-        ok(join('', @aaSequence) eq 'MGKSEGPVGMVESAGRAGQKRPGFLEGGLLLLLLLVTAALVALGVLYADRRGKQLPRLASRLCFLQEERTFVKRKPRGIPEAQEVSEVCTTPGCVIAAARILQNMDPTTEPCDDFYQFACGGWLRRHVIPETNSRYSIFDVLRDELEVILKAVLENSTAKDRPAVEKARTLYRSCMNQSVIEKRGSQPLLDILEVVGGWPVAMDRWNETVGLEWELERQLALMNSQFNRRVLIDLFIWNDDQNSSRHIIYIDQPTLGMPSREYYFNGGSNRKVREAYLQFMVSVATLLREDANLPRDSCLVQEDMVQVLELETQLAKATVPQEERHDVIALYHRMGLEELQSQFGLKGFNWTLFIQTVLSSVKIKLLPDEEVVVYGIPYLQNLENIIDTYSARTIQNYLVWRLVLDRIGSLSQRFKDTRVNYRKALFGTMVEEVRWRECVGYVNSNMENAVGSLYVREAFPGDSKSMVRELIDKVRTVFVETLDELGWMDEESKKKAQEKAMSIREQIGHPDYILEEMNRRLDEEYSNLNFSEDLYFENSLQNLKVGAQRSLRKLREKVDPNLWIIGAAVVNAFYSPNRNQIVFPAGILQPPFFSKEQPQALNFGGIGMVIGHEITHGFDDNGRNFDKNGNMMDWWSNFSTQHFREQSECMIYQYGNYSWDLADEQNVNGFNTLGENIADNGGVRQAYKAYLKWMAEGGKDQQLPGLDLTHEQLFFINYAQVWCGSYRPEFAIQSIKTDVHSPLKYRVLGSLQNLAAFADTFHCARGTPMHPKERCRVW*');
-      }
+      # if($regionDb{$chr}[$txNumber]{$nameFeatIdx} eq 'NM_033467') {
+      #   # https://www.ncbi.nlm.nih.gov/nuccore/NM_033467
+      #   ok(join('', @aaSequence) eq 'MGKSEGPVGMVESAGRAGQKRPGFLEGGLLLLLLLVTAALVALGVLYADRRGKQLPRLASRLCFLQEERTFVKRKPRGIPEAQEVSEVCTTPGCVIAAARILQNMDPTTEPCDDFYQFACGGWLRRHVIPETNSRYSIFDVLRDELEVILKAVLENSTAKDRPAVEKARTLYRSCMNQSVIEKRGSQPLLDILEVVGGWPVAMDRWNETVGLEWELERQLALMNSQFNRRVLIDLFIWNDDQNSSRHIIYIDQPTLGMPSREYYFNGGSNRKVREAYLQFMVSVATLLREDANLPRDSCLVQEDMVQVLELETQLAKATVPQEERHDVIALYHRMGLEELQSQFGLKGFNWTLFIQTVLSSVKIKLLPDEEVVVYGIPYLQNLENIIDTYSARTIQNYLVWRLVLDRIGSLSQRFKDTRVNYRKALFGTMVEEVRWRECVGYVNSNMENAVGSLYVREAFPGDSKSMVRELIDKVRTVFVETLDELGWMDEESKKKAQEKAMSIREQIGHPDYILEEMNRRLDEEYSNLNFSEDLYFENSLQNLKVGAQRSLRKLREKVDPNLWIIGAAVVNAFYSPNRNQIVFPAGILQPPFFSKEQPQALNFGGIGMVIGHEITHGFDDNGRNFDKNGNMMDWWSNFSTQHFREQSECMIYQYGNYSWDLADEQNVNGFNTLGENIADNGGVRQAYKAYLKWMAEGGKDQQLPGLDLTHEQLFFINYAQVWCGSYRPEFAIQSIKTDVHSPLKYRVLGSLQNLAAFADTFHCARGTPMHPKERCRVW*');
+      # }
 
+      if(@warnings) {
+        p @warnings;
+        say join('', @aaSequence);
+      }
       # store the primary key as well as denormalized info
       # since we won't be using this db as a traditional, relational db
       # although we could just ignore the de-normalized data
       # my $txn = $dbs{$chr}{env}->BeginTxn();
-      $personalDb->dbPut($dbs{$chr}, $txNumber, [\@aaSequence, \@codonSequence, [$txName, $cdsStart, $cdsEnd]]);
+      $personalDb->dbPut($dbs{$chr}, $txNumber, [\@aaSequence, \@codonSequence, [$txName, $cdsStart, $cdsEnd], \@warnings]);
 
       $seenTxNums{$chr} //= {};
       $seenTxNums{$chr}{$txNumber} = 1;
@@ -303,64 +315,6 @@ sub makeReferenceProtDb {
   MCE::Loop::finish();
 
   $self->_recordTxNumsWritten($writtenTxNumsHref, $metaEnv, $metaConfig, $metaKeys{refTxsWritten});
-}
-
-sub _recordTxNumsWritten {
-  my ($self, $writtenTxNumsHref, $metaEnv, $metaConfig, $metaKey) = @_;
-
-  my $personalDb = GenPro::DBManager->new();
-
-  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
-    $personalDb->dbPut( $metaDb, $metaKey, $writtenTxNumsHref );
-  undef $metaDb;
-
-  $personalDb->cleanUp();
-}
-
-sub _checkHasTxNumToWrite {
-  my ($self, $wantedTxNumHref, $metaEnv, $metaConfig, $metaKey) = @_;
-
-  my $personalDb = GenPro::DBManager->new();
-
-  my $metaDb = $personalDb->_getDbi( $metaEnv, undef,$metaConfig);
-    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKey );
-  undef $metaDb;
-
-  my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
-
-  my @txNums;
-  my %wantedChrs;
-  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
-    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
-      if(!($writtenChrs{$chr} && $writtenChrs{$chr}{$txNum})) {
-        push @txNums, [$chr, $txNum];
-      }
-    }
-
-    $wantedChrs{$chr} //= 1;
-  }
-
-  # Clear the singleton instance, ensure that threads don't copy any memory
-  $personalDb->cleanUp();
-  undef $personalDb;
-
-  return (\%wantedChrs, \%writtenChrs, \@txNums);
-}
-
-sub _makeRefProgressFunc {
-  my ($self, $writtenTxNumsHref) = @_;
-
-  return sub {
-    my $seenTxNums = shift;
-
-    for my $chr (keys %$seenTxNums) {
-      $writtenTxNumsHref->{$chr} //= {};
-
-      for my $txNum (keys %{$seenTxNums->{$chr}}) {
-        $writtenTxNumsHref->{$chr}{$txNum} = 1;
-      }
-    }
-  };
 }
 
 # Generates everything that GenPro_make_refprotdb does
@@ -460,17 +414,6 @@ sub makeReferenceUniquePeptides {
           if($err) {
             die "Error on commit: $err";
           }
-
-          # if ($LMDB_File::last_err) {
-          #   if ( $LMDB_File::last_err != MDB_KEYEXIST ) {
-
-          #     # TODO: return error from thread, synchronize with other threads $$abortErr
-          #     die "dbPatch put or commit LMDB error $LMDB_File::last_err";
-          #   }
-
-          #   #reset the class error variable, to avoid crazy error reporting later
-          #   $LMDB_File::last_err = 0;
-          # }
         }
       }
     }
@@ -486,6 +429,65 @@ sub makeReferenceUniquePeptides {
   MCE::Loop::finish();
 
   $self->_recordTxNumsWritten($writtenTxNumsHref, $metaEnv, $metaConfig, $metaKeys{refPeptidesWritten});
+}
+
+
+sub _recordTxNumsWritten {
+  my ($self, $writtenTxNumsHref, $metaEnv, $metaConfig, $metaKey) = @_;
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef, $metaConfig );
+    $personalDb->dbPut( $metaDb, $metaKey, $writtenTxNumsHref );
+  undef $metaDb;
+
+  $personalDb->cleanUp();
+}
+
+sub _checkHasTxNumToWrite {
+  my ($self, $wantedTxNumHref, $metaEnv, $metaConfig, $metaKey) = @_;
+
+  my $personalDb = GenPro::DBManager->new();
+
+  my $metaDb = $personalDb->_getDbi( $metaEnv, undef,$metaConfig);
+    my $previouslyWritten = $personalDb->dbReadOne( $metaDb, $metaKey );
+  undef $metaDb;
+
+  my %writtenChrs = $previouslyWritten ? %$previouslyWritten : ();
+
+  my @txNums;
+  my %wantedChrs;
+  for my $chr (sort { $a cmp $b } keys %$wantedTxNumHref) {
+    for my $txNum (sort { $a <=> $b } keys %{$wantedTxNumHref->{$chr}}) {
+      if(!($writtenChrs{$chr} && $writtenChrs{$chr}{$txNum})) {
+        push @txNums, [$chr, $txNum];
+      }
+    }
+
+    $wantedChrs{$chr} //= 1;
+  }
+
+  # Clear the singleton instance, ensure that threads don't copy any memory
+  $personalDb->cleanUp();
+  undef $personalDb;
+
+  return (\%wantedChrs, \%writtenChrs, \@txNums);
+}
+
+sub _makeRefProgressFunc {
+  my ($self, $writtenTxNumsHref) = @_;
+
+  return sub {
+    my $seenTxNums = shift;
+
+    for my $chr (keys %$seenTxNums) {
+      $writtenTxNumsHref->{$chr} //= {};
+
+      for my $txNum (keys %{$seenTxNums->{$chr}}) {
+        $writtenTxNumsHref->{$chr}{$txNum} = 1;
+      }
+    }
+  };
 }
 
 __PACKAGE__->meta->make_immutable;

@@ -47,10 +47,10 @@ has chromosomes => ( is => 'ro', isa => 'ArrayRef', required => 1);
 # TODO: formalize: check that they have name and args properties
 has fileProcessors => ( is => 'ro', isa => 'HashRef', default => 'bystro-vcf' );
 
-# TODO: set the feature names based on the tx track 
+# TODO: set the feature names based on the tx track
 has features => (is => 'ro', isa => 'ArrayRef', init_arg => undef, lazy => 1, default => sub {
   my $self = shift;
-  
+
   my $locationFeatures = $self->locationFeatures;
   my $geneTrackFeatures = $self->geneTrackFeatures;
   my $computedFeatures = $self->computedFeatures;
@@ -81,7 +81,8 @@ has computedFeatures => (is => 'ro', isa => 'ArrayRef', lazy => 1, default => su
 # TODO: allow these to be use the gene track getter defaults
 has geneTrackFeatures => (is => 'ro', isa => 'ArrayRef', lazy => 1, default => sub {
   return [
-    "txNumber", "name", "name2", "exonicAlleleFunction", "strand",
+    "txNumber", "name", "name2", "protAcc", "spID", "spDisplayID", "mRNA", "kgID", "ensemblID",
+    "exonicAlleleFunction", "strand",
     "codonNumber", "codonPosition", "refCodon", "altCodon", "refAminoAcid", "altAminoAcid"
   ];
 });
@@ -94,7 +95,7 @@ has featureDbIdx => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1,
   my $trackName = $self->geneTrack;
 
   my %features;
-  
+
   my $i = -1;
   for my $feat (@{$self->features}) {
     $i++;
@@ -249,7 +250,7 @@ sub makePersonalProtDb {
   my $chrInIdx  = $headers->getFeatureIdx(undef, 'chrom');
   my $posInIdx  = $headers->getFeatureIdx(undef, 'pos');
   my $typeInIdx = $headers->getFeatureIdx(undef, 'type');
-  # We overwrite the reference with 'discordant'; 
+  # We overwrite the reference with 'discordant';
   # So in the header the supplied reference field is replaced with 'discordant';
   my $refInIdx  = $headers->getFeatureIdx(undef, 'discordant');
   my $altInIdx  = $headers->getFeatureIdx(undef, 'alt');
@@ -425,7 +426,7 @@ sub makePersonalProtDb {
         }
       } elsif ( @ok == 1 ) {
         my $txIdx  = $ok[0];
-        
+
         for my $fIdx (@geneIdx) {
           # 0 because non-indels have only 1 position index
           $record[$fIdx->[1]] = $out[ $fIdx->[0] ][0][$txIdx];
@@ -494,7 +495,7 @@ sub makePersonalProtDb {
         $seen{$sample} //= 1;
 
         $cnt++;
-  
+
         # dbPatch with per-op commit seems to work fine
 
         if(!$dbs{$sample}) {
