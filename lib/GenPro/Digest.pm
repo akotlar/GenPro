@@ -7,7 +7,7 @@ package GenPro::Digest;
 use Mouse 2;
 use namespace::autoclean;
 use Carp qw/croak/;
-# use DDP;
+use DDP;
 
 has minPeptideLength => (is => 'ro', isa => 'Int', default => 6);
 has maxPeptideLength => (is => 'ro', isa => 'Int', default => 40);
@@ -32,7 +32,7 @@ has enzymes => (is => 'ro', isa => 'ArrayRef', init_arg => undef, default => sub
 has digestLookups => (is => 'ro', isa => 'HashRef', init_arg => undef, default => sub {
   return \%digestLookups;
 });
-use DDP;
+
 # If a dbConfig is passed, it should have a
 # dbManager and db, where db is a database configuration
 # and should be callable as dbManager->dbReadOne($db, $peptide);

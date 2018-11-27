@@ -1,6 +1,7 @@
 # TODO: Put each database in a separate environemnet, aka folder
 # TODO: Check that we don't want stopGain, stopLoss, startGain, or spliceD/A
-
+# TODO: Clean up the sample peptide database after done? So that we can always
+# Get unique set... or keep around and assume we'll want to re-check what was previously shared
 # or at least put the meta information as a subfolder, say refProteins/meta
 
 use 5.10.0;
@@ -69,6 +70,10 @@ has maxThreads => (is => 'ro', isa => 'Int', lazy => 1, default => sub {
 # TODO: further reduce complexity
 sub BUILD {
   my $self = shift;
+
+  my $p = $self->output_file_base->stringify();
+  $self->{_tsvOut} = "$p.tsv";
+  $self->{_fastaOut} = "$p.fasta";
 
   # Must come before statistics, which relies on a configured Seq::Tracks
   #Expects DBManager to have been given a database_dir
@@ -205,18 +210,21 @@ sub makeSampleUniquePeptides {
     return;
   }
 
-  my $fastaFn = _makeFastaPrintFn($sampleFeatureDbIdx);
+  my ($fastaFn, $tsvHeader) = _makeFastaPrintFn($sampleFeatureDbIdx);
 
   my $txNumberIdx = $sampleFeatureDbIdx->{txNumber};
 
-  my $progressFunc = sub {
-    my $seenSamples = shift;
+  open(my $fastaFh, '>', $self->{_fastaOut});
+  open(my $tsvFh, '>', $self->{_tsvOut});
 
-    for my $sample (keys %$seenSamples) {
-      for my $chr (keys %{$seenSamples->{$sample}}) {
-        $writtenSamples{$sample}{$chr} = 1;
-      }
-    }
+  say $tsvFh $tsvHeader;
+
+  my $progressFunc = sub {
+    # my ($fastaStr, $tsvStr) = @_;
+    #     $_[0],     $_[1]
+
+    say $fastaFh $_[0];
+    say $tsvFh $_[1];
   };
 
   MCE::Loop::init {
@@ -316,8 +324,7 @@ sub makeSampleUniquePeptides {
       #  TODO: figure out  if we can really get away with sort step being done per tx
       # If so, we can print inside the chr loop, save memory
       if(@finalRecords) {
-        MCE->say($fastaFn->($sample, \@finalRecords));
-        # _printJson($sample, \@finalRecords);
+        $fastaFn->($mce, $sample, \@finalRecords);
       }
     }
 
@@ -355,10 +362,13 @@ sub _makeFastaPrintFn {
   my @fIdx = map { $featureDbIdx->{$_} } @names;
   my @idx = 0 .. $#names;
 
-  return sub {
-    my ($sample, $finalRecordsAref) = @_;
+  my $tsvHeader = join("\t", 'seq', 'HGVS_C', 'HGVS_P', 'HGVS_G', @names);
+  
+  my $fn = sub {
+    my ($mce, $sample, $finalRecordsAref) = @_;
 
-    my @out;
+    my @fasta;
+    my @tsv;
     for my $rec (@$finalRecordsAref) {
       # my $info = $rec->[0];
 
@@ -382,19 +392,35 @@ sub _makeFastaPrintFn {
         $rec->[$_]
       } 0 .. $#$rec);
 
-      my $header = join('|', map {
-        $names[$_] . '=' . (
-          ref $tx->[$fIdx[$_]]
-          ? join(',', @{$tx->[$fIdx[$_]]})
-          : (defined $tx->[$fIdx[$_]] ? $tx->[$fIdx[$_]] : '.')
-        )
-      } @idx ) . '|' . join(',', @c) . '|' . join(',', @p) . '|' . join(',', @g);
+      my $c = join(',', @c);
+      my $p = join(',', @p);
+      my $g = join(',', @g);
 
-      push @out, ">$header\n" . join('', @{$rec->[1]});
+      my $header = ">";
+
+      my @data;
+      foreach (@idx) {
+        if(!defined $tx->[$fIdx[$_]]) {
+          push @data, '.';
+        } elsif(ref $tx->[$fIdx[$_]]) {
+          push @data, join(',', @{$tx->[$fIdx[$_]]});
+        } else {
+          push @data, $tx->[$fIdx[$_]];
+        }
+      }
+
+      my $seq = join('', @{$rec->[1]});
+
+      # Single concatenation for efficiency (avoid copying the string array by avoiding .=)
+      push @fasta, '>' . join('|', map { $names[$_] . '=' . $data[$_] } @idx ) . "|$c|$p|$g\n$seq";
+
+      push @tsv, join("\t", $seq, $c, $p, $g, @data)
     }
 
-    return join("\n", @out);
-  }
+    $mce->gather(join("\n", @fasta), join("\n", @tsv));
+  };
+
+  return ($fn, $tsvHeader);
 }
 # Takes a variant record, with N affected transcripts,
 # de-convolutes those,
@@ -481,12 +507,13 @@ sub makeVarProtForTxFn {
 
     my (@uniqueRecords, %seqWithUnique);
 
-    if(!$refAaSeq->[-1] eq '*') {
-      say STDERR "Got a transcript without a trailing stop";
-      $seqWithUnique{-9} = [ undef, [@$refAaSeq], undef ];
-    } else {
-      $seqWithUnique{-9} = [ undef, [ @$refAaSeq[ 0 .. $#$refAaSeq - 1 ] ], undef ];
-    }
+    # if(!$refAaSeq->[-1] eq '*') {
+    #   say STDERR "Got a transcript without a trailing stop";
+    #   $seqWithUnique{-9} = [ undef, [@$refAaSeq], undef ];
+    # } else {
+    #   $seqWithUnique{-9} = [ undef, [ @$refAaSeq[ 0 .. $#$refAaSeq - 1 ] ], undef ];
+    # }
+    $seqWithUnique{-9} = [ undef, [@$refAaSeq], undef ];
 
     my $max = -9; #+ sum map { $_->[$codonNumIdx] } @$varTxAref;
 
@@ -508,14 +535,14 @@ sub makeVarProtForTxFn {
 
       # This exits too early
       # if($codonNum - $lastCodonNum > $maxPeptideLength) {
-      #   last;
+      #   next;
       # }
 
       # $lastCodonNum = $codonNum;
 
       # my $altAa = $var->[$altAaIdx];
 
-      if(!$cutsHref->{$var->[$altAaIdx]}) {
+      if(!$cutsHref->{$var->[$altAaIdx]} && $codonNum - $lastCodonNum > $maxPeptideLength) {
         next;
       }
 
@@ -548,6 +575,9 @@ sub makeVarProtForTxFn {
         # if($newSeq[$codonNum - 1] eq '*') {
         #   next;
         # }
+        if($newSeq[$codonIdx] eq '*') {
+          next;
+        }
 
         $newSeq[$codonIdx] = $var->[$altAaIdx];
 
@@ -644,7 +674,6 @@ sub _configureVarProtFn {
 
     return @unique;
   };
-
 
   my %txHasUniqueConfig= (
     altAaIdx => $altAaIdx,

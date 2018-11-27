@@ -10,7 +10,7 @@ use DDP;
 # TODO: Test that lengths work
 
 my $digest = GenPro::Digest->new({
-  minPeptideLength => 5,
+  minPeptideLength => 6,
   maxPeptideLength => 40,
 });
 
