@@ -39,7 +39,7 @@ has digestLookups => (is => 'ro', isa => 'HashRef', init_arg => undef, default =
 # Also, if provided, it will check uniqueness
 
 sub makeDigestFunc {
-  my ($self, $type, $dbConfig) = @_;
+  my ($self, $type) = @_;
 
   # Cache because Perl/Mouse accessors slow
   my $minPeptideLength = $self->minPeptideLength;
