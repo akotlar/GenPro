@@ -32,7 +32,7 @@ has enzymes => (is => 'ro', isa => 'ArrayRef', init_arg => undef, default => sub
 has digestLookups => (is => 'ro', isa => 'HashRef', init_arg => undef, default => sub {
   return \%digestLookups;
 });
-
+use DDP;
 # If a dbConfig is passed, it should have a
 # dbManager and db, where db is a database configuration
 # and should be callable as dbManager->dbReadOne($db, $peptide);
@@ -55,8 +55,15 @@ sub makeDigestFunc {
   return sub {
     my $aaAref = shift;
 
+    if(!@$aaAref) {
+      return;
+    }
+
     my @cutSites;
-    my $lastCutSite = 0;
+
+    # Use this to track maximum length of peptide, excluding the "*"
+    # and everything after it
+    my $effectiveLength = @$aaAref;
 
     my $i = -1;
     my $start;
@@ -66,52 +73,63 @@ sub makeDigestFunc {
     for my $aa (@$aaAref) {
       $i++;
 
+      # TODO: Should we skip stop?
+      # Is this identical to $trim_end_regex qr{\*[\*\w]*\z}; $peptide =~ /$trim_end_regex//xm
+      # Should be, this removes everything after an observed * (including the *)
       if($aa eq '*') {
+        # This tracks the end of the non-NMD protein (effectively trims \*\w*)
+        $effectiveLength = $i + 1;
         last;
       }
 
       if($cuts{$aa}) {
         push @cutSites, $i + 1;
-        $lastCutSite = $i + 1;
       }
     }
 
     # if a K or R at the end, don't include it twice but also include the
     # end of the protein
-    if( $lastCutSite < @$aaAref) {
-      push @cutSites, scalar @$aaAref;
+    if( $cutSites[-1] < $effectiveLength) {
+      push @cutSites, $effectiveLength;
     }
 
-    # reset
-    $lastCutSite = 0;
-
-    $i = -1;
-    for my $end (@cutSites) {
-      $i++;
+    # reset, and now use this to create the left bound so that we 
+    # may test if our fragment is too short or too long
+    my $lastCutSite = 0;
+    $i = 0;
+    # Iterate over $_ to avoid the confusiong that for my $end (@cutSites)
+    # actually copies $end; no, instead it is a mutable reference
+    # and that means mutating it will cause major issues (modify @cutSites in the middle of execution
+    # This is also the fastest way
+    # https://stackoverflow.com/questions/10487316/best-way-to-iterate-through-a-perl-array
+    foreach (@cutSites) {
+      # In this loop $_ is an element of @cutSites, is 1 past the end of the cut 
 
       # Don't add + 1 because we take lastCutSite .. $end - 1, so this is already +1 length
       # and because end in the above is $i + 1
-      if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
-        push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+      if($_ - $lastCutSite >= $minPeptideLength  && $_ - $lastCutSite <= $maxPeptideLength) {
+        push @peptides, join('', @$aaAref[ $lastCutSite .. $_ - 1 ]);
       }
 
-      if ( $end == @$aaAref ) {
+      if ( $_ == $effectiveLength ) {
         last;
       }
 
-      # If the next base is a proline that blocks
-      if( $blocks{$aaAref->[$end]} ) {
+      # If the next base is a proline (or other blocker for a different cutter)
+      if( $blocks{$aaAref->[$_]} ) {
         # any more cut sites?
         if( $i + 1 < @cutSites) {
-          $end = $cutSites[ $i + 1 ];
+          # Cannot re-assign $end, that will modify @cutSites...
+          my $tailEnd = $cutSites[ $i + 1 ];
 
-          if($end - $lastCutSite >= $minPeptideLength && $end - $lastCutSite <= $maxPeptideLength) {
-            push @peptides, join('', @$aaAref[ $lastCutSite .. $end - 1 ]);
+          if($tailEnd - $lastCutSite >= $minPeptideLength && $tailEnd - $lastCutSite <= $maxPeptideLength) {
+            push @peptides, join('', @$aaAref[ $lastCutSite .. $tailEnd - 1 ]);
           }
         }
       }
 
-      $lastCutSite = $end;
+      $lastCutSite = $_;
+      $i++;
     }
 
     return @peptides;
