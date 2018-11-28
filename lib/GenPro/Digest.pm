@@ -89,7 +89,7 @@ sub makeDigestFunc {
 
     # if a K or R at the end, don't include it twice but also include the
     # end of the protein
-    if( $cutSites[-1] < $effectiveLength) {
+    if( !@cutSites || $cutSites[-1] < $effectiveLength) {
       push @cutSites, $effectiveLength;
     }
 

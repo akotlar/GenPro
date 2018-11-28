@@ -248,6 +248,7 @@ sub makeSampleUniquePeptides {
     my ($txHasUniquePeptidesFn, $cleanUp) = $self->_configureVarProtFn($sampleFeatureDbIdx, $refPeptideConfig);
 
     for my $sample (@{ $chunk_ref }) {
+      # p $sample;
       my @finalRecords;
 
       my $samplePeptideDb = $personalDb->_getDbi( "$sample/peptide", 'trypsin', {maxDbs => 3, stringKeys => 1} );
@@ -257,6 +258,9 @@ sub makeSampleUniquePeptides {
 
         my $sampleDb = $personalDb->_getDbi( $sample, $chr, \%sampleReadOnlyConfig );
 
+        # At this point, memory usage is 8MB per thread
+
+        # This step eats a few mb for 1M variants on chr1, negligible.
         my $variantsAref = $personalDb->dbReadAll($sampleDb);
 
         if(!defined $variantsAref) {
@@ -268,6 +272,7 @@ sub makeSampleUniquePeptides {
         # txName => [first modification, 2nd modification, etc]
         # Where each modification = contains a reference to the record
         # from the
+        # This step seems to eat about 1 more megabyte
         my $userTxHref = _orderByDesired($variantsAref, $txNumberIdx);
 
         for my $txNum (sort {$a <=> $b} keys %$userTxHref) {
@@ -278,14 +283,17 @@ sub makeSampleUniquePeptides {
             next;
           }
 
+          # This seems to also eat no meaningful memory; memory is still 8MB / thread
           my $refSequenceInfo = $personalDb->dbReadOne($refProteinDbs{$chr}, $txNum);
 
           if(!$refSequenceInfo) {
             die "Couldn't find transcript number $txNum for chr $chr";
           }
 
+          # Memory usage is essentially flat here too. + 5MB
           my $uniquePeptidesAref = $txHasUniquePeptidesFn->($userVars, $refSequenceInfo->[0]);
-
+          undef  $uniquePeptidesAref;
+          next;
           if(!@$uniquePeptidesAref) {
             next;
           }
@@ -295,6 +303,13 @@ sub makeSampleUniquePeptides {
           # as $txHasUniquePeptidesFn stores
           # \@{all affected txs}, \@{alt aa sequence}, \@uniquePeptides
           # where uniquePeptides is also modified by sortByUniquePeptides
+
+          # This  also seems to eat no meaningful memory;
+          # 1 thread jumps to 22MB, the others between 9 and 16MB; usage grows slowly
+          # Then spikes to 63MB; then main process goes up to 800MB..... then lots more
+          # Not sure what's happening. Maybe a lot of garbage being generated.
+          # Still only 2 threads have a lot of usage;  The first one (624MB) and the 2nd 435MB
+          # My first guess is that this is just the memory being read by LMDB, not actual usage
           my @sortedRecs = _sortUniquePeptides($uniquePeptidesAref, $txNum, $personalDb, $samplePeptideDb);
 
           while(@sortedRecs) {
@@ -363,7 +378,7 @@ sub _makeFastaPrintFn {
   my @idx = 0 .. $#names;
 
   my $tsvHeader = join("\t", 'seq', 'HGVS_C', 'HGVS_P', 'HGVS_G', @names);
-  
+
   my $fn = sub {
     my ($mce, $sample, $finalRecordsAref) = @_;
 
@@ -507,55 +522,22 @@ sub makeVarProtForTxFn {
 
     my (@uniqueRecords, %seqWithUnique);
 
-    # if(!$refAaSeq->[-1] eq '*') {
-    #   say STDERR "Got a transcript without a trailing stop";
-    #   $seqWithUnique{-9} = [ undef, [@$refAaSeq], undef ];
-    # } else {
-    #   $seqWithUnique{-9} = [ undef, [ @$refAaSeq[ 0 .. $#$refAaSeq - 1 ] ], undef ];
-    # }
     $seqWithUnique{-9} = [ undef, [@$refAaSeq], undef ];
 
-    my $max = -9; #+ sum map { $_->[$codonNumIdx] } @$varTxAref;
-
+    my $max = -9;
+    my $lastCodonIdx = 1;
     # TODO: do we want to sort and drop based on the lastCodon condition?
     # for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
-    for my $var (@$varTxAref) {
+    for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
       my $codonIdx = $var->[$codonNumIdx] - 1;
 
-      # This only works if we don't break out of this loop early
+      # This only works if we don't break out of this loop early or skip iterations
       $max += $codonIdx;
-      # TODO: CHECK ON THIS: THOMAS HAS THIS INITIALIZED TO 1, WHICH I THINK
-      # MAY CAUSE SOME COMBINATIONS NOT TO BE SEEN (WHEN THE FIRST CODON)
-      # IS > maxPeptideLength away
-      # $lastCodonNum //= $codonNum;
 
-      # We can avoid running this condition if we
-      # Both of these are 1-based, so add 1 to be consistent with other
-      # parts of the application, or more succinctly choose > instead of >=
-
-      # This exits too early
-      # if($codonNum - $lastCodonNum > $maxPeptideLength) {
-      #   next;
-      # }
-
-      # $lastCodonNum = $codonNum;
-
-      # my $altAa = $var->[$altAaIdx];
-
-      if(!$cutsHref->{$var->[$altAaIdx]} && $codonNum - $lastCodonNum > $maxPeptideLength) {
+      # This saves a HUGE amount of memory: using this == ~.1xwithout
+      if(!$cutsHref->{$var->[$altAaIdx]} && $codonIdx - $lastCodonIdx > $maxPeptideLength) {
         next;
       }
-
-      # my $refAa = $var->[$refAaIdx];
-
-      # my $expectedRef = $seqWithUnique{-9}[1][$codonNum - 1];
-
-      # if(!defined $expectedRef) {
-      #   p %seqWithUnique;
-      #   p $varTxAref;
-      #   p $refAaSeq;
-      #   die "Not defined $codonNum: $refAa";
-      # }
 
       if($var->[$refAaIdx] ne $seqWithUnique{-9}[1][$codonIdx]) {
         die "Sample's ref AA != reference amino acid $seqWithUnique{-9}[1][$codonIdx] @ codonIdx: $codonIdx";
@@ -566,15 +548,8 @@ sub makeVarProtForTxFn {
         # Mutate that
         my @newSeq = @{$seqWithUnique{$i}[1]};
 
-        # Thomas did this in the seq_of_per_prot, aka the seqWithUnique loop
-        # but that seems unnecessary, since we should by definition
-        # never have a replacement site at a stop codon
-        # and our stop codon should be at the end of the reference
-        # so to save time on if statements and indexing
-        # we should chomp the array
-        # if($newSeq[$codonNum - 1] eq '*') {
-        #   next;
-        # }
+        # This is needed to avoid undefined behavior if an interstitial stop
+        # is identified
         if($newSeq[$codonIdx] eq '*') {
           next;
         }
@@ -612,6 +587,8 @@ sub makeVarProtForTxFn {
         # whether we've made a record with all substitutions
         $seqWithUnique{$i + $codonIdx} = $recAref;
       }
+
+      $lastCodonIdx = $codonIdx;
     }
 
     # Many times we'll never not have $max
