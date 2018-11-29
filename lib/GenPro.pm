@@ -112,7 +112,6 @@ sub annotate {
     output_file_base => $self->output_file_base,
     temp_dir => $self->temp_dir,
     chromosomes => $self->chromosomes,
-    # assembly => $self->assembly,
   });
 
   ( $err, $sampleList, $wantedTxNums ) = $sampleBuilder->go();
@@ -170,6 +169,7 @@ sub makeSampleUniquePeptides {
   my $sampleConfig = $configs->{sample};
   my $sampleFeatureDbIdx = $sampleConfig->{featureDbIdx};
   my %sampleReadOnlyConfig = (%{$sampleConfig->{dbConfig}}, (readOnly => 1));
+  my %samplePeptideConfig  = (maxDbs => scalar @{$digest->enzymes}, stringKeys => 1);
 
   my $refPeptideConfig = $configs->{refPeptide};
 
@@ -237,6 +237,7 @@ sub makeSampleUniquePeptides {
   };
 
   my @wantedChrs = keys %$wantedTxNumHref;
+  my $sampleDbConfig = $self->{_sampleDbConfig};
 
   mce_loop {
     my ($mce, $chunk_ref, $chunk_id) = @_;
@@ -246,9 +247,10 @@ sub makeSampleUniquePeptides {
 
     my %refProteinDbs;
 
+    my @finalRecords;
     # my $sample = $_;
     for my $sample (@{ $chunk_ref }) {
-      my $samplePeptideDb = $personalDb->_getDbi( "$sample/peptide", 'trypsin', {maxDbs => 3, stringKeys => 1} );
+      my $samplePeptideDb = $personalDb->_getDbi( "$sample/peptide", 'trypsin', \%samplePeptideConfig );
 
       my $config = {
         refPeptideConfig => $refPeptideConfig,
@@ -268,6 +270,9 @@ sub makeSampleUniquePeptides {
 
         # This step eats a few mb for 1M variants on chr1, negligible.
         my $variantsAref = $personalDb->dbReadAll($sampleDb);
+
+        # Go out of scope early,
+        undef $sampleDb;
 
         if(!defined $variantsAref) {
           say STDERR "Found no txs for $sample on chr $chr";
@@ -296,8 +301,11 @@ sub makeSampleUniquePeptides {
             die "Couldn't find transcript number $txNum for chr $chr";
           }
 
+          # Tracking unique peptides at the tx level reduces memory usage
+          # by roughly 50-75%; max real memory of ~100MB vs 400 without per thread
+          my %seen;
           # Memory usage is essentially flat here too. + 5MB
-          my $uniquePeptidesAref = $txHasUniquePeptidesFn->($userVars, $refSequenceInfo->[0]);
+          my $uniquePeptidesAref = $txHasUniquePeptidesFn->($userVars, $refSequenceInfo->[0], \%seen);
 
           if(!@$uniquePeptidesAref) {
             next;
@@ -317,7 +325,7 @@ sub makeSampleUniquePeptides {
           # My first guess is that this is just the memory being read by LMDB, not actual usage
           my @sortedRecs = _sortUniquePeptides($uniquePeptidesAref, $txNum, $personalDb, $samplePeptideDb);
 
-          my @finalRecords;
+          @finalRecords =  ();
           while(@sortedRecs) {
             my $rec = shift @sortedRecs;
             push @finalRecords, [$rec->[0], $rec->[1]];
@@ -350,6 +358,10 @@ sub makeSampleUniquePeptides {
 
       # Clean up the progress function
       $cleanUp->();
+
+      # Reduce number of open file handles
+      $personalDb->closeEnv( $sample );
+      $personalDb->closeEnv( "$sample/peptide" );
     }
 
   } @toGetSamples;
@@ -372,6 +384,7 @@ sub _makeFastaPrintFn {
   # The sample variant features
   my $featureDbIdx = shift;
 
+  my $chrIdx = $featureDbIdx->{chrom};
   my $codonNumIdx = $featureDbIdx->{codonNumber};
   my $codonPosIdx = $featureDbIdx->{codonPosition};
   my $posIdx = $featureDbIdx->{pos};
@@ -480,19 +493,21 @@ sub _sortUniquePeptides {
   my ($recsAref, $txNum, $dbManager, $db) = @_;
 
   my @finalRecords;
+  my $txn = $dbManager->getTxn($db);
   for my $rec (sort { @{$b->[2]} <=> @{$a->[2]} } @$recsAref) {
     # Check each peptide against
     my @uniquePeptides;
 
     for my $peptide (@{$rec->[2]}) {
-      my $seenAref = $dbManager->dbReadOne($db, $peptide);
+      my $seenAref = $dbManager->dbReadOneRaw($txn, $db->{dbi}, $peptide);
 
       if(defined $seenAref) {
         $seenAref->[0] += 1;
         push @{$seenAref->[1]}, $txNum;
 
-        $dbManager->dbPut($db, $peptide, $seenAref);
-
+        $dbManager->dbPutRaw($txn, $db->{dbi}, $peptide, $seenAref);
+        $txn->commit();
+        $txn = $dbManager->getTxn($db);
         next;
       }
 
@@ -506,6 +521,7 @@ sub _sortUniquePeptides {
     }
   }
 
+  $txn->commit();
   return @finalRecords;
 }
 
@@ -532,7 +548,7 @@ sub makeVarProtForTxFn {
   # But we're still using say 1GB per thread...
   # It does get collected though...
   return sub {
-    my ($varTxAref, $refAaSeq) = @_;
+    my ($varTxAref, $refAaSeq, $seenHref) = @_;
 
     my (@uniqueRecords, %seqWithUnique);
 
@@ -541,6 +557,7 @@ sub makeVarProtForTxFn {
     my $max = -9;
     my $lastCodonIdx = 0;
     my $longer = 0; my $shorter = 0;
+
     # TODO: do we want to sort and drop based on the lastCodon condition?
     # for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
     for my $var (sort { $a->[$codonNumIdx] <=> $b->[$codonNumIdx] } @$varTxAref) {
@@ -551,10 +568,9 @@ sub makeVarProtForTxFn {
 
       # This saves a large amount of memory (probably garbage) (1/3x)
       # and run time
-      if(!$cutsHref->{$var->[$altAaIdx]} && $codonIdx - $lastCodonIdx > $maxPeptideLength) {
-
-        next;
-      }
+      # if(!$cutsHref->{$var->[$altAaIdx]} && $codonIdx - $lastCodonIdx > $maxPeptideLength) {
+      #   next;
+      # }
 
       if($var->[$refAaIdx] ne $seqWithUnique{-9}[1][$codonIdx]) {
         die "Sample's ref AA != reference amino acid $seqWithUnique{-9}[1][$codonIdx] @ codonIdx: $codonIdx";
@@ -573,7 +589,7 @@ sub makeVarProtForTxFn {
 
         $newSeq[$codonIdx] = $var->[$altAaIdx];
 
-        my @uniquePeptides = $globalUniquePeptideFn->(\@newSeq);
+        my @uniquePeptides = $globalUniquePeptideFn->(\@newSeq, $seenHref);
 
         if(@uniquePeptides == 0) {
           if($i != -9) {
@@ -676,9 +692,9 @@ sub _configureVarProtFn {
   my $kept = 0;
   # No effect on memory usage
   my $globalUniquePeptideFn = sub {
-    my $aaAref = shift;
+    my ($aaAref, $seenLocally) = @_;
 
-    my $sampleTxn = $sampleDb->{env}->BeginTxn();
+    my $sampleTxn = $dbManager->getTxn($sampleDb, $dbManager->MDB_RDONLY);
 
     if(!$sampleTxn) {
       die "Couldn't open txn for sample";
@@ -687,12 +703,14 @@ sub _configureVarProtFn {
     my @unique;
     for my $peptide ($digestFunc->($aaAref)) {
        if(!defined $dbManager->dbReadOneRaw($refPeptideTxn, $refPeptideDbi, $peptide)) {
-          if(defined $dbManager->dbReadOneRaw($sampleTxn, $sampleDb->{dbi}, $peptide)) {
+          if(($seenLocally && $seenLocally->{$peptide})
+          || defined $dbManager->dbReadOneRaw($sampleTxn, $sampleDb->{dbi}, $peptide)) {
             $skipped++;
             next
           }
 
           push @unique, $peptide;
+          $seenLocally->{$peptide} = 1;
           $kept++;
       }
     }

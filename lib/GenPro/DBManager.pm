@@ -45,7 +45,7 @@ has dryRun => ( is => 'rw', isa => 'Bool', default => 0, lazy => 1 );
 has envs => (is => 'ro', isa => 'HashRef', init_arg => undef, default => sub {{}});
 
 # has cursors => (is => 'ro', isa => 'HashRef');
-# 
+#
 # DBManager maintains its own, internal log, so that in a multi-user environment
 # DBA can keep track of key errors
 # TODO: Warning: cwd may fill up if left unchecked
@@ -78,7 +78,7 @@ my %instanceConfig;
 
 # We are enforcing a singel transaction per environment for the moment, especially
 # in light of the apparent LMDB_File restriction to this effect
-my %cursors;
+# my %cursors;
 
 # Can call as class method (DBManager->setDefaultDatabaseDir), or as instanceConfig method
 # Prepares the class for consumption; should be run before the program can fork
@@ -236,18 +236,19 @@ sub dbReadRaw {
 }
 
 sub getTxn {
-  my ($self, $db);
-
-  my $dbi = $db->{dbi};
-
-  if ( !$db->{db}->Alive ) {
-    $db->{db}->Txn = ${ $db->{env} }->BeginTxn();
-
-    # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
-    $db->{db}->Txn->AutoCommit(1);
+  #my ($self, $db, $flags);
+  #    $_[0], $_[1], $_[2]
+  # Should maybe issue warning here
+  if($_[1]->{db}->Alive ) {
+    $_[1]->{db}->Txn->commit();
   }
 
-  return $db->{db}->Txn;
+  $_[1]->{db}->Txn = $_[2] ? $_[1]->{env}->BeginTxn($_[2]) : $_[1]->{env}->BeginTxn();
+
+  # not strictly necessary, but I am concerned about hard to trace abort bugs related to scope
+  $_[1]->{db}->Txn->AutoCommit(1);
+
+  return $_[1]->{db}->Txn;
 }
 
 # Write transactions are by default committed
@@ -283,7 +284,7 @@ sub dbPutRaw {
   #my ( $self, $txn,  $dbi,  $key,  $value     = @_;
       # $_[0]  $_[1], $_[2], $_[3], $_[4]
   $_[1]->put( $_[2], $_[3], $mp->pack($_[4]) );
-   
+
   if ($LMDB_File::last_err) {
     if ( $LMDB_File::last_err != MDB_KEYEXIST && $LMDB_File::last_err != MDB_NOTFOUND ) {
       $_[0]->_errorWithCleanup("dbPut LMDB error: $LMDB_File::last_err");
@@ -301,7 +302,7 @@ sub dbPutRaw {
 # Read transactions are by default not committed
 sub dbReadAll {
   my ( $self, $db, $skipCommit ) = @_;
-  
+
   if ( !$db->{db}->Alive ) {
     $db->{db}->Txn = $db->{env}->BeginTxn();
 
@@ -434,8 +435,8 @@ sub _getDbi {
   # Exists and not defined, because in read only database we may discovercea
   # that some chromosomes don't have any data (example: hg38 refSeq chrM)
   # my ( $self, $name, $table, $onfig ) = @_;
-  #       $_[0]  $_[1], $_[2],  
-  
+  #       $_[0]  $_[1], $_[2],
+
   if (  $_[0]->envs->{ $_[1] } && $_[0]->envs->{ $_[1] }{ $_[2] || 0 } ) {
     return $_[0]->envs->{ $_[1] }{ $_[2] || 0 };
   }
@@ -531,7 +532,7 @@ sub _getDbi {
   }
 
   my $DB = $txn->OpenDB( $table, $dbFlags );
-  
+
   if ($LMDB_File::last_err) {
     $self->_errorWithCleanup(
       "Failed to open database $name:$table for
@@ -589,6 +590,13 @@ sub dbForceCommit {
   return;
 }
 
+#  Let the environment go out of scope, so that LMDB_File can clean it up
+sub closeEnv  {
+  my ($self, $envName) = @_;
+
+  delete $instance->{$envName};
+}
+
 # This can be called without instantiating Seq::DBManager, either as :: or -> class method
 # @param <Seq::DBManager> $self (optional)
 # @param <String> $envName (optional) : the name of a specific environment
@@ -610,6 +618,7 @@ sub cleanUp {
 
   undef $instance;
   return;
+
 
   # The below seems to cause issues; get 22 EINVAL
   # when opening thousands of parallel databases and calling this
@@ -699,7 +708,7 @@ sub cleanUp {
 
 sub cleanAndWipeSingleton {
   my $self = shift;
-  
+
   $self->cleanUp();
 
   undef $instance;
@@ -1128,7 +1137,7 @@ sub _fatalError {
 # Removed delete, overwrite capacities
 # sub dbPatch {
 #   my ( $self, $db,       $trackIndex, $pos,  $trackValue, $mergeFunc, $skipCommit) = @_;
-#   #.   $_[0], $_[1]    , $_[2]  ,     $_[3], $_[4],       $_[5]      , $_[6] 
+#   #.   $_[0], $_[1]    , $_[2]  ,     $_[3], $_[4],       $_[5]      , $_[6]
 
 #   die "NOT IMPLEMENTED YET";
 

@@ -58,6 +58,14 @@ has features => (is => 'ro', isa => 'ArrayRef', init_arg => undef, lazy => 1, de
   return [@$locationFeatures, @$computedFeatures, @$geneTrackFeatures];
 });
 
+# Leaky, but the sample peptide and sample replacement site (this package)
+# databases we may want to allow to be one  environment, multiple tables
+has maxDbs => (is => 'ro', isa => 'Int', lazy => 1, default => sub {
+  my $self = shift;
+
+  return scalar @{$self->chromosomes};
+});
+
 has dbConfig => (is => 'ro', isa => 'HashRef', init_arg => undef, lazy => 1,
 default => sub {
   my $self = shift;
@@ -66,7 +74,7 @@ default => sub {
 
   return {
     # + 5 because we need 1 global peptide database, and want to leave some headroom,
-    maxDbs => $nChrs,
+    maxDbs => $self->maxDbs,
   }
 });
 
